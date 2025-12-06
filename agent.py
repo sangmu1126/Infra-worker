@@ -123,8 +123,17 @@ class NanoAgent:
             
             logger.info("✅ Task Completed", id=task.request_id, ms=result.duration_ms)
 
+            # Metrics Update
+            status = "success" if result.success else "failure"
+            self.jobs_processed.labels(status=status, runtime=task.runtime).inc()
+            self.job_duration.labels(runtime=task.runtime).observe(result.duration_ms / 1000.0)
+
         except Exception as e:
             logger.error("Task processing failed", error=str(e))
+            self.jobs_processed.labels(status="error", runtime="unknown").inc()
+            
+        finally:
+            self.active_jobs.dec()
 
 if __name__ == "__main__":
     agent = NanoAgent()
