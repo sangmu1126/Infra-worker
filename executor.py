@@ -170,7 +170,7 @@ class TaskExecutor:
                 # 여기서는 편의상 전체 작업 루트를 마운트
                 volumes={self.cfg["DOCKER_WORK_DIR_ROOT"]: {"bind": "/workspace", "mode": "rw"}},
                 network_mode="bridge", # AI Endpoint 접근 허용
-                mem_limit="512m",    # 컨테이너 하드 리밋
+                mem_limit=f"{task.memory_mb}m",    # 컨테이너 하드 리밋 (Dynamic)
                 cpu_quota=50000      # 0.5 CPU
             )
             c.pause()
