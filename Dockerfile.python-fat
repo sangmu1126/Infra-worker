@@ -1,0 +1,23 @@
+# Dockerfile.python-fat
+FROM python:3.9-slim
+
+# 시스템 의존성 설치 (numpy/pandas 등을 위해 필요할 수 있음)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 자주 사용되는 패키지 사전 설치
+RUN pip install --no-cache-dir \
+    requests \
+    numpy \
+    pandas \
+    pillow \
+    boto3 \
+    httpx
+
+# 작업 디렉토리
+WORKDIR /code
+
+# Output 디렉토리 생성 (bind mount point)
+RUN mkdir -p /output && chmod 777 /output
