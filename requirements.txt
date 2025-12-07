@@ -3,3 +3,4 @@ redis
 docker
 structlog
 python-dotenv
+prometheus_client
