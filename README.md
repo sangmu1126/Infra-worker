@@ -41,3 +41,14 @@
 
    ```bash
    pip install -r requirements.txt
+   ```
+
+### 8. CloudWatch Integration
+- **Peak Memory Metrics**: `CloudWatchPublisher`는 각 작업의 메모리 사용량을 `NanoGrid/FunctionRunner` 네임스페이스에 게시합니다.
+- **Metric Details**:
+  - `PeakMemoryBytes`: 작업 실행 중 기록된 최대 메모리 사용량 (Bytes).
+  - Dimensions: `FunctionId`, `Runtime`.
+
+### 9. LLM Usage Metering
+- **Token Usage Tracking**: LLM 작업의 경우 `.llm_usage_stats.jsonl` 파일에서 토큰 사용량(Prompt Evaluation, Evaluation Count)을 수집합니다.
+- **Billing Data**: 수집된 토큰 수는 `ExecutionResult`에 포함되어 과금 및 사용량 분석에 활용됩니다.
