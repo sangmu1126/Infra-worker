@@ -1,12 +1,120 @@
-## About this repository
+Infra-worker
 
-This repository is a reorganized/refactored version of the original NanoGrid-Agent-PY codebase:  
-https://github.com/Softbank-Final/NanoGrid-Agent-PY
+Infra-worker는 서버리스 아키텍처에서 작업 실행과 결과 처리를 담당하는 Python 기반의 워커입니다. 이 프로젝트는 S3에서 파일을 다운로드하고, Docker 컨테이너에서 작업을 실행하며, 결과를 Redis와 S3에 업로드하는 등의 작업을 처리합니다. 또한 Prometheus를 사용하여 작업의 성과를 모니터링합니다.
 
-The code here has been cleaned up and structured for clarity, but it originates from that project.
+주요 기능
 
----
+SQS 메시지 처리:
 
-## 👥 Contributors
+AWS SQS(Long Polling): NanoAgent는 AWS SQS 큐에서 메시지를 수신하여 작업을 처리합니다. SQS는 안정적인 메시징 서비스로, 메시지가 대기 중일 때 에이전트가 이를 받아 작업을 처리합니다. 수신한 메시지는 JSON 형식으로 파싱되어 TaskMessage 객체로 변환됩니다.
 
-- [iyeojae](https://github.com/iyeojae) — collaboration on refactoring and enhancements  
+작업 처리: 각 작업은 고유한 requestId와 관련된 데이터를 포함하고 있으며, 이를 기반으로 실제 실행이 이루어집니다.
+
+Docker 컨테이너 워밍 풀:
+
+콜드 스타트 문제 해결: NanoAgent는 Docker 컨테이너를 미리 시작하여 콜드 스타트 문제를 방지합니다. 다양한 언어(예: Python, C++, Node.js, Go)의 작업을 실행할 수 있도록 설정된 Warm Pool에서 미리 컨테이너를 시작하고, 필요한 작업을 빠르게 처리할 수 있습니다.
+
+자동 컨테이너 관리: 워밍 풀에 컨테이너가 부족할 경우, 자동으로 새로운 컨테이너를 생성하여 풀에 추가됩니다. 이를 통해 대기 시간을 최소화하고 성능을 최적화할 수 있습니다.
+
+작업 실행 및 결과 처리:
+
+S3에서 코드 다운로드: TaskExecutor는 각 작업에 필요한 코드를 S3에서 다운로드합니다. 작업 파일은 ZIP 형식으로 저장되며, 이를 안전하게 추출하여 실행합니다.
+
+Zip Slip 방지: ZIP 파일을 추출할 때, 디렉토리 탐색에 의한 보안 취약점을 방지하기 위해 Zip Slip 방지 코드를 적용합니다. 이는 추출된 파일이 예상된 디렉토리 구조 내에서만 접근되도록 제한합니다.
+
+Docker에서 실행: 다운로드한 코드 파일은 Docker 컨테이너 내에서 실행됩니다. 각 작업은 동적으로 할당된 메모리와 CPU 자원을 기반으로 실행되며, 메모리 최적화 및 성능을 고려한 설정이 이루어집니다.
+
+메모리 최적화 및 비용 절감:
+
+메모리 분석: 작업 실행 중 컨테이너에서 사용된 메모리를 추적하고, 메모리 사용 패턴을 분석하여 최적화 팁을 제공합니다. 예를 들어, 사용된 메모리가 할당량보다 적을 경우, 메모리 할당을 줄여 비용을 절감할 수 있습니다.
+
+비용 절감 제안: AutoTuner 클래스는 사용된 메모리와 할당된 메모리를 비교하여 메모리 절감 팁을 제공합니다. 예를 들어, 메모리 사용량이 적을 경우, 할당된 메모리 양을 줄여 비용을 절감할 수 있는 방법을 안내합니다.
+
+월간 절감액 계산: 메모리 최적화를 통해 예상되는 월간 절감액도 계산하여 사용자에게 제공하며, 실제로 사용할 메모리와 비교하여 비용 효율적인 운영을 도와줍니다.
+
+Prometheus Metrics:
+
+모니터링 및 메트릭 수집: NanoAgent는 Prometheus와 통합되어 작업 처리에 대한 다양한 메트릭을 수집합니다. Prometheus 메트릭 서버는 기본적으로 포트 8000에서 실행되며, 다음과 같은 메트릭을 제공합니다:
+
+처리된 작업 수: 각 상태별(성공, 실패, 에러)로 처리된 작업의 총 수.
+
+작업 실행 시간: 각 작업의 실행 시간을 기록하며, 실행 시간이 길어진 작업에 대한 모니터링을 지원합니다.
+
+현재 실행 중인 작업 수: 현재 진행 중인 작업의 수를 실시간으로 추적합니다.
+
+효율적인 모니터링: Prometheus를 사용하여 시스템의 효율성을 추적하고, 성능 개선의 기회를 식별할 수 있습니다. 예를 들어, CPU와 메모리 사용량, 작업 처리 대기 시간 등을 실시간으로 모니터링할 수 있습니다.
+
+Redis를 통한 결과 처리:
+
+Pub/Sub 방식: 각 작업이 완료되면, 결과는 Redis를 통해 Pub/Sub 방식으로 전파됩니다. 이를 통해 다른 시스템이나 컴포넌트가 실시간으로 결과를 수신할 수 있습니다.
+
+Async 조회: 작업 결과는 Redis에 저장되며, 사용자가 비동기적으로 결과를 조회할 수 있도록 TTL (Time-to-Live) 기능을 활용하여 일정 시간 동안 저장됩니다.
+
+결과 저장: 작업 결과는 S3에 업로드되어 저장되며, 각 작업의 고유한 URL을 반환하여 사용자가 결과를 손쉽게 조회할 수 있습니다.
+
+S3 결과 업로드:
+
+작업 결과 저장: OutputUploader 클래스는 각 작업의 결과를 S3 버킷에 업로드하고, 업로드된 파일들의 URL을 반환합니다. 이를 통해 사용자는 결과 파일을 안전하게 보관하고, 필요시 URL을 통해 파일을 다운로드할 수 있습니다.
+
+파일 업로드 경로: 결과 파일은 outputs/{job_id}/{filename} 형식으로 저장되며, 업로드 후 생성된 URL은 S3의 공개 URL 형식을 따릅니다.
+
+설치 방법
+
+필수 라이브러리 설치:
+
+이 프로젝트는 Python 3.7 이상을 필요로 합니다. 필수 라이브러리를 설치하려면 다음 명령어를 사용하세요:
+
+pip install -r requirements.txt
+
+
+환경 변수 설정:
+
+.env 파일을 생성하여 필요한 환경 변수들을 설정합니다. 예시:
+
+AWS_REGION=ap-northeast-2
+REDIS_HOST=localhost
+REDIS_PORT=6379
+SQS_QUEUE_URL=your_sqs_queue_url
+S3_BUCKET_NAME=your_s3_bucket_name
+DOCKER_WORK_DIR_ROOT=/path/to/your/work/dir
+
+사용법
+
+NanoAgent 실행:
+
+NanoAgent는 SQS에서 작업을 가져와 실행하고, Redis에 결과를 게시합니다. 이를 실행하려면 아래와 같이 실행합니다:
+
+python infra-worker/agent.py
+
+
+작업 처리 및 실행:
+
+TaskExecutor는 실제 작업을 Docker 컨테이너에서 실행하는 역할을 합니다. 작업은 S3에서 다운로드하고, 지정된 컨테이너에서 실행됩니다.
+
+OutputUploader:
+
+OutputUploader 클래스는 작업 결과를 S3에 업로드하고, 업로드된 파일들의 URL을 반환합니다.
+
+Prometheus Metrics:
+
+Prometheus는 HTTP 서버를 통해 작업 관련 메트릭을 수집할 수 있습니다. 기본적으로 포트 8000에서 실행됩니다.
+
+# Prometheus 메트릭 서버 시작
+python infra-worker/agent.py
+
+디렉토리 구조
+Infra-worker/
+├── infra-worker/
+│   ├── agent.py           # NanoAgent - SQS에서 메시지 수신 및 작업 실행
+│   ├── executor.py        # TaskExecutor - Docker에서 작업 실행 및 결과 처리
+│   ├── uploader.py        # OutputUploader - 작업 결과를 S3에 업로드
+│   ├── requirements.txt   # 필수 라이브러리
+├── .env                   # 환경 변수 설정 파일
+├── README.md              # 이 문서
+└── Dockerfile             # Docker 환경 설정 파일 (선택 사항)
+
+참고 사항
+
+Docker 컨테이너: 이 프로젝트는 다양한 언어(예: Python, C++, Node.js, Go)의 코드를 Docker에서 실행합니다. 각 런타임에 맞는 Docker 이미지를 사용하며, Docker 컨테이너에서 작업을 실행할 때 메모리와 CPU 제한을 설정할 수 있습니다.
+
+메모리 최적화: AutoTuner는 실행 중인 컨테이너의 메모리 사용량을 기반으로 최적화 팁을 제공하고, 비용 절감을 위한 제안을 합니다.
