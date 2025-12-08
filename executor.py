@@ -62,50 +62,50 @@ class ExecutionResult:
 # --- Service Logic ---
 
 class AutoTuner:
-    """메모리 최적화 팁 생성 (비용 절감 핵심)"""
-    COST_PER_MB_HOUR = 0.00005  # $0.00005 (임의의 AWS EC2 GB-hour 비용 기반 추정)
+    """Generate memory optimization tips (Key for cost savings)"""
+    COST_PER_MB_HOUR = 0.00005  # $0.00005 (Estimated based on loose AWS EC2 GB-hour cost)
 
     @staticmethod
     def analyze(peak_bytes: int, allocated_mb: int):
         if not peak_bytes: return None, None
-        if allocated_mb <= 0: allocated_mb = 128  # 0 나누기 방어
+        if allocated_mb <= 0: allocated_mb = 128  # Guard against division by zero
 
         peak_mb = peak_bytes / (1024 * 1024)
         
-        # 1. 팁 생성
+        # 1. Generate Tip
         tip = None
         ratio = peak_mb / allocated_mb
         if ratio < 0.3:
-            rec = max(int(peak_mb * 1.5), 10) # 최소 10MB 권장
+            rec = max(int(peak_mb * 1.5), 10) # Recommend at least 10MB
             saved_percent = int((1 - (rec / allocated_mb)) * 100)
             if saved_percent > 0:
-                tip = f"💡 Tip: 실제 사용량({int(peak_mb)}MB)이 할당량({allocated_mb}MB)보다 훨씬 적습니다. {rec}MB로 줄여 비용을 약 {saved_percent}% 절감하세요."
+                tip = f"💡 Tip: Actual usage ({int(peak_mb)}MB) is much less than allocated ({allocated_mb}MB). Reduce to {rec}MB to save approx {saved_percent}%."
         elif ratio > 0.9:
             rec = int(peak_mb * 1.2)
-            tip = f"⚠️ Warning: 메모리가 부족합니다({int(peak_mb)}MB). {rec}MB 이상으로 늘리는 것을 권장합니다."
+            tip = f"⚠️ Warning: Memory tight ({int(peak_mb)}MB). Recommend increasing to {rec}MB+."
 
-        # 2. 비용 절감액 계산 (비즈니스 관점)
-        # 가정: 기존 VM 오버헤드 1024MB 대비 절감
+        # 2. Calculate Cost Savings (Business Perspective)
+        # Assumption: Savings compared to 1024MB VM overhead
         vm_overhead_mb = 1024
         saved_mb = vm_overhead_mb - peak_mb
         estimated_savings = None
         
         if saved_mb > 0:
-            # 월간 절감액 (730시간 기준)
+            # Monthly savings (based on 730 hours)
             monthly_saving = saved_mb * AutoTuner.COST_PER_MB_HOUR * 730
             estimated_savings = f"${monthly_saving:.2f}/month (vs 1GB VM)"
 
         return tip, estimated_savings
 
 class CloudWatchPublisher:
-    """ASG 연동을 위한 CloudWatch 메트릭 전송"""
+    """Send CloudWatch metrics for ASG integration"""
     def __init__(self, region):
         self.client = boto3.client("cloudwatch", region_name=region)
         
     def publish_peak_memory(self, func_id, runtime, bytes_used):
         try:
             if bytes_used is None: return
-            # 비동기로 처리하면 더 좋음 (여기선 로깅만)
+            # Better if async (logging only here)
             # logger.debug("Publishing CloudWatch Metric", value=bytes_used)
             self.client.put_metric_data(
                 Namespace="NanoGrid/FunctionRunner",
@@ -121,7 +121,7 @@ class CloudWatchPublisher:
             logger.warning("CloudWatch publish failed", error=str(e))
 
 class TaskExecutor:
-    """통합 실행 엔진: S3 다운로드 -> Docker 실행 -> 결과 처리"""
+    """Integrated Execution Engine: S3 Download -> Docker Run -> Result Processing"""
     
     def __init__(self, config: Dict):
         self.cfg = config
@@ -133,7 +133,7 @@ class TaskExecutor:
             region=config.get("AWS_REGION", "ap-northeast-2")
         )
         
-        # Warm Pool 저장소
+        # Warm Pool Storage
         self.pools = {
             "python": deque(), "cpp": deque(), "nodejs": deque(), "go": deque()
         }
@@ -144,10 +144,15 @@ class TaskExecutor:
             "go": config.get("DOCKER_GO_IMAGE", "golang:1.19-alpine")
         }
         
+        # Runtime-specific locks
+        self.pool_locks = {
+            k: threading.Lock() for k in ["python", "cpp", "nodejs", "go"]
+        }
+        
         self._initialize_warm_pool()
 
     def _initialize_warm_pool(self):
-        """Warm Pool 초기화 (Cold Start 제거)"""
+        """Initialize Warm Pool (Eliminate Cold Start)"""
         counts = {
             "python": int(self.cfg.get("WARM_POOL_PYTHON_SIZE", 1)),
             "cpp": int(self.cfg.get("WARM_POOL_CPP_SIZE", 1)),
@@ -163,13 +168,13 @@ class TaskExecutor:
     def _create_warm_container(self, runtime: str) -> str:
         try:
             img = self.images.get(runtime)
-            # 무한 대기 컨테이너 실행
+            # Run infinite wait container
             c = self.docker.containers.run(
                 img, command="tail -f /dev/null", detach=True,
-                # 호스트 경로 마운트 (코드 실행용) - 읽기 전용으로 마운트하거나 필요한 경로만 마운트 권장
-                # 여기서는 편의상 전체 작업 루트를 마운트
+                # Mount host path (for code execution) - Read-only or limiting paths is recommended
+                # Mounting entire work root for convenience here
                 volumes={self.cfg["DOCKER_WORK_DIR_ROOT"]: {"bind": "/workspace", "mode": "rw"}},
-                network_mode="bridge", # AI Endpoint 접근 허용
+                network_mode="bridge", # Allow AI Endpoint access
                 mem_limit="1024m",   # Default (Will be updated in run)
                 cpu_quota=100000     # 1.0 CPU
             )
@@ -181,28 +186,37 @@ class TaskExecutor:
             return None
 
     def _acquire_container(self, runtime: str):
-        """Warm Pool에서 컨테이너 획득 (Unpause)"""
+        """Acquire container from Warm Pool (Unpause)"""
         target_runtime = runtime if runtime in self.pools else "python"
         
-        # Pool이 비어있으면 즉시 생성 (동기)
-        if not self.pools[target_runtime]:
-            logger.warning("Pool empty, creating new container synchronously", runtime=target_runtime)
-            cid = self._create_warm_container(target_runtime)
-            # 방금 만든건 append 되었으므로 다시 pop 해야 함
-            if not cid: raise RuntimeError("Failed to create container")
+        # Create immediately if pool is empty (Synchronous)
+        # Use lock to ensure atomic check-and-act
+        cid = None
+        with self.pool_locks[target_runtime]:
+            if not self.pools[target_runtime]:
+                logger.warning("Pool empty, creating new container synchronously", runtime=target_runtime)
+                # Create container INSIDE lock to prevent multiple threads creating simultaneously for same depletion
+                cid = self._create_warm_container(target_runtime)
+                if not cid: raise RuntimeError("Failed to create container")
             
+            # Now pop (guaranteed to have one unless creation failed)
+            if self.pools[target_runtime]:
+                cid = self.pools[target_runtime].popleft()
+            
+        if not cid:
+             raise RuntimeError("Failed to acquire container")
+
         try:
-            cid = self.pools[target_runtime].popleft()
             c = self.docker.containers.get(cid)
             if c.status == 'paused':
                 c.unpause()
             return c
         except Exception:
-            # 실패 시(이미 죽은 컨테이너 등) 재귀적으로 다시 시도
+            # Retry recursively on failure (e.g., dead container)
             return self._acquire_container(target_runtime)
 
     def _replenish_pool(self, runtime: str):
-        """[Fix 1] Replenish the warm pool asynchronously after usage"""
+        """Replenish the warm pool asynchronously after usage"""
         def _create():
             try:
                 self._create_warm_container(runtime)
@@ -214,7 +228,7 @@ class TaskExecutor:
         threading.Thread(target=_create, daemon=True).start()
 
     def _prepare_workspace(self, task: TaskMessage) -> Path:
-        """S3 다운로드 및 [보안] Zip Slip 방지 압축 해제"""
+        """S3 Download and [Security] Zip Slip prevention during extraction"""
         local_dir = Path(self.cfg["DOCKER_WORK_DIR_ROOT"]) / task.request_id
         if local_dir.exists(): shutil.rmtree(local_dir)
         local_dir.mkdir(parents=True, exist_ok=True)
@@ -223,16 +237,16 @@ class TaskExecutor:
         bucket = task.s3_bucket if task.s3_bucket else self.cfg["S3_CODE_BUCKET"]
         self.s3.download_file(bucket, task.s3_key, str(zip_path))
         
-        # Zip Slip 방지 코드 적용
+        # Zip Slip prevention code
         with zipfile.ZipFile(zip_path, "r") as zf:
             for member in zf.namelist():
-                # 상위 디렉터리(../) 접근 시도 차단
+                # Block attempts to access parent directory (../)
                 target_path = (local_dir / member).resolve()
                 if not str(target_path).startswith(str(local_dir.resolve())):
                     logger.warning("Zip Slip attempt detected", file=member)
                     continue
                 
-                # 파일 추출
+                # Extract file
                 if member.endswith('/'):
                     target_path.mkdir(parents=True, exist_ok=True)
                 else:
@@ -242,7 +256,7 @@ class TaskExecutor:
         
         zip_path.unlink()
 
-        # [Feature 2] Inject ai_client.py
+        # Inject ai_client.py
         try:
             current_dir = Path(__file__).parent
             src_client = current_dir / "ai_client.py"
@@ -258,24 +272,24 @@ class TaskExecutor:
         start_time = time.time()
         
         try:
-            # 1. 작업 공간 준비
+            # 1. Prepare workspace
             host_work_dir = self._prepare_workspace(task)
-            # 컨테이너 내부 경로 (/workspace 가 바인드 되어있으므로 그 하위 경로 사용)
+            # Container internal path (use subpath as /workspace is bound)
             container_work_dir = f"/workspace/{task.request_id}"
 
-            # 2. 컨테이너 획득 (Warm Start)
+            # 2. Acquire container (Warm Start)
             container = self._acquire_container(task.runtime)
             
-            # [Fix 1] Trigger pool replenishment immediately
+            # Trigger pool replenishment immediately
             self._replenish_pool(task.runtime)
             
-            # 동적 메모리 제한 적용 (실행 직전)
+            # Apply dynamic memory limit (Just before execution)
             try:
                 container.update(mem_limit=f"{task.memory_mb}m", memswap_limit=f"{task.memory_mb}m")
             except Exception as e:
                 logger.warning("Failed to update container memory limit", error=str(e))
             
-            # 3. 실행 커맨드 구성
+            # 3. Configure execution command
             # Output Directory Setup
             host_output_dir = host_work_dir / "output"
             host_output_dir.mkdir(parents=True, exist_ok=True)
@@ -291,22 +305,21 @@ class TaskExecutor:
                 "AI_ENDPOINT": self.cfg.get("AI_ENDPOINT", "http://10.0.20.100:11434"),
                 "JOB_ID": task.request_id,
                 "LLM_MODEL": task.model_id,
-                "OUTPUT_DIR": "/output" # [Fix 3] Explicit output directory env var
+                "OUTPUT_DIR": "/output" # Explicit output directory env var
             }
 
             cmd = []
             if task.runtime == "python": 
                 cmd = ["sh", "-c", f"{setup_cmd} && python {container_work_dir}/main.py"]
             elif task.runtime == "cpp":  
-                # C++은 컴파일 후 실행
+                # C++: Compile then execute
                 cmd = ["sh", "-c", f"{setup_cmd} && g++ {container_work_dir}/main.cpp -o {container_work_dir}/out && {container_work_dir}/out"]
             elif task.runtime == "nodejs": 
                 cmd = ["sh", "-c", f"{setup_cmd} && node {container_work_dir}/index.js"]
             elif task.runtime == "go":
-                # Go는 빌드 후 실행
+                # Go: Build then execute
                 cmd = ["sh", "-c", f"{setup_cmd} && cd {container_work_dir} && go build -o main main.go && ./main"]
 
-            # 4. 실행 (Exec)
             # 4. 실행 (Exec) with Timeout
             logger.info("Exec command", cmd=cmd, container=container.id[:12], timeout_ms=task.timeout_ms)
             
@@ -326,7 +339,7 @@ class TaskExecutor:
             import threading
             exec_thread = threading.Thread(target=run_docker_exec)
             
-            # [Fix 2] Memory Monitoring
+            # Memory Monitoring
             metrics = {"peak_memory": 0}
             stop_monitoring = threading.Event()
 
@@ -356,7 +369,7 @@ class TaskExecutor:
             
             if exec_thread.is_alive():
                 logger.error("Execution Timed Out", timeout_ms=task.timeout_ms)
-                # 컨테이너 강제 종료 (finally 블록에서 삭제됨)
+                # Force kill container (Removed in finally block)
                 container.kill()
                 raise TimeoutError(f"Execution timed out after {task.timeout_ms}ms")
             
@@ -366,7 +379,7 @@ class TaskExecutor:
             exit_code = exec_result["exit_code"]
             output = exec_result["output"]
             
-            # 하드코딩 제거 & 실제 메모리 측정
+            # Actual memory measurement
             # Use monitored peak memory if available
             usage = metrics["peak_memory"]
             
@@ -386,9 +399,9 @@ class TaskExecutor:
             self.cw.publish_peak_memory(task.function_id, task.runtime, usage)
             
             # 7. Output Upload
-            # 컨테이너 내에서 /output에 쓴 파일들은 host_output_dir에 저장됨
+            # Files written to /output in container are saved to host_output_dir
             
-            # [Feature 3] Usage Metering Collection (Thread-safe JSONL)
+            # Usage Metering Collection (Thread-safe JSONL)
             llm_token_count = 0
             usage_file = host_output_dir / ".llm_usage_stats.jsonl"
             if usage_file.exists():
@@ -430,14 +443,13 @@ class TaskExecutor:
             )
             
         finally:
-            # 오염된 컨테이너는 재사용하지 않고 폐기
+            # Discard polluted container (do not reuse)
             if container:
                 try:
-                    # Dirty Container Removal
                     container.remove(force=True)
                 except: pass
             
-            # 파일 삭제
+            # Clean up files
             if host_work_dir and host_work_dir.exists():
                 try: shutil.rmtree(host_work_dir)
                 except: pass
