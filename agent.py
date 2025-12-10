@@ -23,9 +23,9 @@ structlog.configure(
 )
 logger = structlog.get_logger()
 
-class NanoAgent:
+class InfraAgent:
     def __init__(self):
-        logger.info("🤖 NanoGrid Agent Starting...")
+        logger.info("🤖 Infra Worker Agent Starting...")
         
         # 환경 변수 로드
         self.config = {k: v for k, v in os.environ.items()}
@@ -137,5 +137,5 @@ class NanoAgent:
             self.active_jobs.dec()
 
 if __name__ == "__main__":
-    agent = NanoAgent()
+    agent = InfraAgent()
     agent.run()

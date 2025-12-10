@@ -1,5 +1,5 @@
 [Unit]
-Description=NanoGrid Worker Agent Service
+Description=Infra Worker Agent Service
 After=network.target docker.service
 Requires=docker.service
 
@@ -7,15 +7,15 @@ Requires=docker.service
 Type=simple
 User=ec2-user
 Group=ec2-user
-WorkingDirectory=/home/ec2-user/nanogrid-worker
-EnvironmentFile=/etc/nanogrid/worker.env
-ExecStart=/usr/bin/python3 /home/ec2-user/nanogrid-worker/agent.py
+WorkingDirectory=/home/ec2-user/infra-worker
+EnvironmentFile=/etc/infra/worker.env
+ExecStart=/usr/bin/python3 /home/ec2-user/infra-worker/agent.py
 Restart=always
 RestartSec=10
 # 로그 설정
 StandardOutput=syslog
 StandardError=syslog
-SyslogIdentifier=nanogrid-worker
+SyslogIdentifier=infra-worker
 
 [Install]
 WantedBy=multi-user.target
