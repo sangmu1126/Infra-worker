@@ -106,7 +106,17 @@ class InfraAgent:
             logger.info("🚀 Processing Task", id=task.request_id, runtime=task.runtime)
 
             # 2. 작업 실행 (Warm Pool 사용)
-            result = self.executor.run(task)
+            result = None
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                try:
+                    result = self.executor.run(task)
+                    break
+                except Exception as e:
+                    logger.warning("Docker execution failed", attempt=attempt+1, error=str(e))
+                    if attempt == max_attempts - 1:
+                        raise e
+                    time.sleep(1)
 
             # 3. 결과 Redis 발행 (Pub/Sub + KV 저장)
             result_dict = result.to_dict()
@@ -114,12 +124,20 @@ class InfraAgent:
             
             # Pub/Sub 채널
             channel = f"result:{task.request_id}"
-            self.redis_client.publish(channel, json_result)
-            
-            # Async 조회용 키 저장 (TTL 1시간)
-            self.redis_client.setex(f"job:{task.request_id}", 3600, json_result)
-            
-            # 4. SQS 메시지 삭제
+            for attempt in range(max_attempts):
+                try:
+                    self.redis_client.publish(channel, json_result)
+                    
+                    # Async 조회용 키 저장 (TTL 1시간)
+                    self.redis_client.setex(f"job:{task.request_id}", 3600, json_result)
+                    break
+                except Exception as e:
+                    logger.warning("Redis publish failed", attempt=attempt+1, error=str(e))
+                    if attempt == max_attempts - 1:
+                        raise e
+                    time.sleep(1)
+
+            # 4. SQS 메시지 삭제 (Successful processing)
             self.sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
             
             logger.info("✅ Task Completed", id=task.request_id, ms=result.duration_ms)
