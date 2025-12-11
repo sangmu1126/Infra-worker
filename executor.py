@@ -127,6 +127,11 @@ class TaskExecutor:
     
     def __init__(self, config: Dict):
         self.cfg = config
+        
+        # Ensure workspace exists with user permissions BEFORE Docker creates it as root
+        if "DOCKER_WORK_DIR_ROOT" in config:
+            Path(config["DOCKER_WORK_DIR_ROOT"]).mkdir(parents=True, exist_ok=True)
+            
         self.docker = docker.from_env()
         self.s3 = boto3.client("s3", region_name=config.get("AWS_REGION", "ap-northeast-2"))
         self.cw = CloudWatchPublisher(config.get("AWS_REGION", "ap-northeast-2"))
