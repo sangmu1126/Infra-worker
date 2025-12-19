@@ -4,3 +4,4 @@ docker
 structlog
 python-dotenv
 prometheus_client
+requests
