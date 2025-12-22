@@ -66,6 +66,9 @@ class InfraAgent:
         except Exception as e:
             logger.error("Failed to start metrics server", error=str(e))
 
+        # Start System Status Publisher (Background Thread)
+        threading.Thread(target=self._publish_system_status, daemon=True).start()
+
         while self.running:
             try:
                 # 1. SQS Long Polling
@@ -155,6 +158,38 @@ class InfraAgent:
             
         finally:
             self.active_jobs.dec()
+
+    def _publish_system_status(self):
+        """
+        [Background Task] Publish System Status to Redis
+        - Frequency: Every 2 seconds
+        - Data: Warm Pool sizes, Active Job count, Worker ID
+        - Purpose: Real-time dashboard monitoring
+        """
+        while self.running:
+            try:
+                # 1. Collect current metrics
+                status = {
+                    "timestamp": time.time(),
+                    "worker_id": self.config.get("HOSTNAME", "unknown"),
+                    "pools": {
+                        "python": len(self.executor.pools["python"]),
+                        "nodejs": len(self.executor.pools["nodejs"]),
+                        "cpp": len(self.executor.pools["cpp"]),
+                        "go": len(self.executor.pools["go"])
+                    },
+                    "active_jobs": self.active_jobs._value.get()
+                }
+                
+                # 2. Publish to Redis (Key: 'system:status', TTL: 10s)
+                # Overwrites the key to keep the latest status only.
+                self.redis_client.setex("system:status", 10, json.dumps(status))
+                
+            except Exception as e:
+                logger.warning("Failed to publish system status", error=str(e))
+            
+            time.sleep(2)
+
 
 if __name__ == "__main__":
     agent = InfraAgent()
