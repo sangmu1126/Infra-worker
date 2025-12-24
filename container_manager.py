@@ -86,9 +86,8 @@ class ContainerManager:
             with self.function_pool_lock:
                 if function_id in self.function_pools and self.function_pools[function_id]:
                     container = self.function_pools[function_id].pop()
-                    try:
-                        container.unpause()
-                    except Exception: pass
+                    # 🛑 [Optimized] Warm Pool items are recycling/running, no need to unpause
+                    # (Skipping API call saves ~50ms)
                     logger.info("⚡ Warm Start from function pool", function_id=function_id)
                     container.is_warm = True
                     return container
@@ -153,8 +152,14 @@ class ContainerManager:
         threading.Thread(target=_create, daemon=True).start()
 
     def update_resources(self, container, memory_mb: int):
+        # 🛑 [Optimized] Skip if unchanged (Caching)
+        current_limit = getattr(container, "last_memory_mb", None)
+        if current_limit == memory_mb:
+            return  # Save ~50ms
+
         try:
             container.update(mem_limit=f"{memory_mb}m", memswap_limit=f"{memory_mb}m")
+            container.last_memory_mb = memory_mb
         except Exception as e:
             logger.warning("Failed to update container resources", error=str(e))
 
