@@ -263,6 +263,7 @@ class TaskExecutor:
                         if container.status == 'paused':
                             container.unpause()
                         logger.info("⚡ Warm Start from function pool", function_id=function_id)
+                        container.is_warm = True  # Mark as warm
                         return container
                     except Exception:
                         pass  # Container dead, fall through to generic pool
@@ -290,6 +291,7 @@ class TaskExecutor:
             # Only replenish when generic pool is used (not for warm start)
             self._replenish_pool(target_runtime)
             
+            c.is_warm = False  # Mark as cold
             return c
         except Exception:
             return self._acquire_container(target_runtime, function_id)
@@ -500,8 +502,15 @@ class TaskExecutor:
                 env_vars["PAYLOAD"] = payload_str
 
             # [SECURITY] Inject Code + Payload into Container
-            logger.info("Injecting code to container", id=container.id[:12])
-            self._copy_to_container(container, host_work_dir, container_work_dir)
+            # Optimization: Skip injection if Warm Start AND Payload is small (in env vars)
+            is_warm = getattr(container, "is_warm", False)
+            has_large_payload = "PAYLOAD_FILE" in env_vars
+            
+            if not is_warm or has_large_payload:
+                logger.info("Injecting code to container", id=container.id[:12], reason="Cold Start" if not is_warm else "Large Payload")
+                self._copy_to_container(container, host_work_dir, container_work_dir)
+            else:
+                logger.info("⚡ Skipping code injection (Warm Start)", id=container.id[:12])
 
             cmd = []
             if task.runtime == "python": 
