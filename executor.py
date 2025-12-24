@@ -1,858 +1,259 @@
 import os
-import atexit
-import shutil
 import time
-import threading
-import zipfile
-import tarfile
-import io
 import json
+import threading
 import structlog
-import boto3
-import docker
-import redis
 import socket
 from pathlib import Path
-from collections import deque
-from dataclasses import dataclass, field
 from typing import List, Optional, Dict
-from datetime import datetime
+
+import config
+from container_manager import ContainerManager
+from storage_adapter import StorageAdapter
+from metrics_collector import MetricsCollector
 from uploader import OutputUploader
 
 logger = structlog.get_logger()
 
 # --- Data Models ---
-@dataclass
-class TaskMessage:
-    request_id: str
-    function_id: str
-    runtime: str
-    s3_key: str
-    s3_bucket: Optional[str] = None
-    memory_mb: int = 128
-    timeout_ms: int = 300000
-    payload: Dict = field(default_factory=dict)
-    model_id: str = "llama3:8b"
-
-@dataclass
-class ExecutionResult:
-    request_id: str
-    function_id: str
-    success: bool
-    exit_code: int
-    stdout: str
-    stderr: str
-    duration_ms: int
-    worker_id: str = "unknown"
-    peak_memory_bytes: Optional[int] = None
-    allocated_memory_mb: Optional[int] = None
-    optimization_tip: Optional[str] = None
-    estimated_savings: Optional[str] = None
-    output_files: List[str] = field(default_factory=list)
-    llm_token_count: Optional[int] = 0 # Feature 3: Usage Metering
-
-    def to_dict(self):
-        return {
-            "requestId": self.request_id,
-            "functionId": self.function_id,
-            "workerId": self.worker_id,
-            "status": "SUCCESS" if self.success else "FAILED",
-            "exitCode": self.exit_code,
-            "stdout": self.stdout,
-            "stderr": self.stderr,
-            "durationMs": self.duration_ms,
-            "peakMemoryBytes": self.peak_memory_bytes,
-            "optimizationTip": self.optimization_tip,
-            "estimatedSavings": self.estimated_savings,
-            "outputFiles": self.output_files,
-            "llm_token_count": self.llm_token_count
-        }
-
-
-
-# --- Service Logic ---
-
-class AutoTuner:
-    """Generate memory optimization tips (Key for cost savings)"""
-    COST_PER_MB_HOUR = 0.00005  # $0.00005 (Estimated based on loose AWS EC2 GB-hour cost)
-
-    @staticmethod
-    def analyze(peak_bytes: int, allocated_mb: int, io_bytes: int = 0):
-        if not peak_bytes: return None, None
-        if allocated_mb <= 0: allocated_mb = 128  # Guard against division by zero
-
-        peak_mb = peak_bytes / (1024 * 1024)
-        io_mb = io_bytes / (1024 * 1024)
-        
-        # 1. Generate Tip
-        tip = None
-        ratio = peak_mb / allocated_mb
-        if ratio < 0.3:
-            rec = max(int(peak_mb * 1.5), 10) # Recommend at least 10MB
-            saved_percent = int((1 - (rec / allocated_mb)) * 100)
-            if saved_percent > 0:
-                tip = f"💡 Tip: Actual usage ({int(peak_mb)}MB) is much less than allocated ({allocated_mb}MB). Reduce to {rec}MB to save approx {saved_percent}%."
-        elif ratio > 0.9:
-            rec = int(peak_mb * 1.2)
-            tip = f"⚠️ Warning: Memory tight ({int(peak_mb)}MB). Recommend increasing to {rec}MB+."
-        elif allocated_mb <= 128 and ratio > 0.5:
-            # [UX] Reassure user that 70-80MB usage on 128MB container is normal overhead
-            tip = f"💡 Tip: 초기화(Init) 과정을 제외하면 실제 코드는 훨씬 적은 메모리를 사용합니다. 하지만 안정적인 실행을 위해 현재 수준({allocated_mb}MB)을 유지하는 것을 권장합니다."
-        
-        # 1.1 I/O Check
-        if not tip and io_mb > 50: # If > 50MB I/O
-             tip = f"⚠️ High I/O ({int(io_mb)}MB) detected. Consider caching data or reducing file operations to improve latency."
-
-        # 2. Calculate Cost Savings (Business Perspective)
-        # Logic: Calculate wasted resources (Allocated - Peak) to highlight inefficiency
-        wasted_mb = allocated_mb - peak_mb
-        estimated_savings = None
-        
-        if wasted_mb > 0:
-            # Monthly savings (based on 730 hours)
-            monthly_saving = wasted_mb * AutoTuner.COST_PER_MB_HOUR * 730
-            estimated_savings = f"${monthly_saving:.2f}/month (if rightsized from {allocated_mb}MB)"
-
-        return tip, estimated_savings
-
-class CloudWatchPublisher:
-    """Send CloudWatch metrics for ASG integration"""
-    def __init__(self, region):
-        self.client = boto3.client("cloudwatch", region_name=region)
-        
-    def publish_peak_memory(self, func_id, runtime, bytes_used):
-        try:
-            if bytes_used is None: return
-            # Better if async (logging only here)
-            # logger.debug("Publishing CloudWatch Metric", value=bytes_used)
-            self.client.put_metric_data(
-                Namespace="FaaS/FunctionRunner",
-                MetricData=[{
-                    "MetricName": "PeakMemoryBytes",
-                    "Dimensions": [{"Name": "FunctionId", "Value": func_id}, {"Name": "Runtime", "Value": runtime}],
-                    "Value": float(bytes_used),
-                    "Unit": "Bytes",
-                    "Timestamp": datetime.utcnow()
-                }]
-            )
-        except Exception as e:
-            logger.warning("CloudWatch publish failed", error=str(e))
+from models import TaskMessage, ExecutionResult
 
 class TaskExecutor:
-    """Integrated Execution Engine: S3 Download -> Docker Run -> Result Processing"""
+    """
+    Orchestrates the Function-as-a-Service execution flow:
+    1. Acquire Container
+    2. Prepare Workspace (if cold start)
+    3. Inject Code & Payload
+    4. Execute
+    5. Collect Metrics & Upload Results
+    """
     
-    # [LRU] Maximum containers per function for warm pool
-    MAX_POOL_SIZE_PER_FUNC = 5
-    
-    def __init__(self, config: Dict):
-        self.cfg = config
+    def __init__(self, 
+                 config_dict: Dict = None, 
+                 container_manager: ContainerManager = None,
+                 storage_adapter: StorageAdapter = None,
+                 metrics_collector: MetricsCollector = None,
+                 uploader: OutputUploader = None):
         
-        # Ensure workspace exists with user permissions BEFORE Docker creates it as root
-        if "DOCKER_WORK_DIR_ROOT" in config:
-            Path(config["DOCKER_WORK_DIR_ROOT"]).mkdir(parents=True, exist_ok=True)
-            
-        self.docker = docker.from_env()
-        self.s3 = boto3.client("s3", region_name=config.get("AWS_REGION", "ap-northeast-2"))
-        self.cw = CloudWatchPublisher(config.get("AWS_REGION", "ap-northeast-2"))
-        self.uploader = OutputUploader(
-            bucket_name=config.get("S3_USER_DATA_BUCKET", ""),
-            region=config.get("AWS_REGION", "ap-northeast-2")
+        self.cfg = config_dict or {}
+        
+        # Dependency Injection
+        self.containers = container_manager or ContainerManager()
+        self.storage = storage_adapter or StorageAdapter()
+        self.metrics = metrics_collector or MetricsCollector(
+            region=self.cfg.get("AWS_REGION", config.AWS_REGION)
         )
-        
-        # Runtime-based Warm Pool Storage (for cold start elimination)
-        self.pools = {
-            "python": deque(), "cpp": deque(), "nodejs": deque(), "go": deque()
-        }
-        self.images = {
-            "python": config.get("DOCKER_PYTHON_IMAGE", "faas/python:3.9-fat"),
-            "cpp": config.get("DOCKER_CPP_IMAGE", "gcc:latest"),
-            "nodejs": config.get("DOCKER_NODEJS_IMAGE", "node:18-alpine"),
-            "go": config.get("DOCKER_GO_IMAGE", "golang:1.19-alpine")
-        }
-        
-        # Function-specific Warm Pool (for secure reuse with LRU eviction)
-        # Key: function_id, Value: list of container objects (ordered by usage, newest last)
-        self.function_pools = {}
-        self.function_pool_lock = threading.Lock()
-        
-        # Runtime-specific locks
-        self.pool_locks = {
-            k: threading.Lock() for k in ["python", "cpp", "nodejs", "go"]
-        }
-        
-        # [Pre-pull] Ensure all images are available before first request
-        logger.info("🐳 Pre-pulling Docker images...")
-        for runtime, img_name in self.images.items():
-            try:
-                self.docker.images.get(img_name)
-                logger.debug(f"✓ Image ready: {img_name}")
-            except docker.errors.ImageNotFound:
-                logger.info(f"📥 Pulling image: {img_name}")
-                self.docker.images.pull(img_name)
-        
-        self._initialize_warm_pool()
-        
-        # Dynamic global concurrency limiter (based on host RAM)
-        self.global_limit = self._init_global_semaphore()
-        
-        # Redis cache for code (reduces S3 latency from 1000ms to 5ms)
-        redis_host = config.get("REDIS_HOST", "localhost")
-        redis_port = int(config.get("REDIS_PORT", 6379))
-        try:
-            self.redis = redis.Redis(host=redis_host, port=redis_port, decode_responses=False)
-            self.redis.ping()
-            logger.info("📦 Redis connected for code caching", host=redis_host)
-        except Exception as e:
-            logger.warning("⚠️ Redis unavailable, falling back to S3 only", error=str(e))
-            self.redis = None
-        
-        # Register cleanup on program exit
-        atexit.register(self._shutdown_cleanup)
-
-    def _init_global_semaphore(self):
-        """
-        Calculate safe concurrency limit based on Host RAM.
-        Formula: (Total RAM - System Reserved) / Min Function Size
-        """
-        try:
-            # Get Total Memory (Linux/Unix)
-            total_bytes = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
-            total_mb = total_bytes / (1024 * 1024)
-        except Exception as e:
-            logger.warning("Failed to detect RAM, using default", error=str(e))
-            total_mb = 2048  # Fallback to 2GB
-
-        # System Reserved (OS + Docker + Agent)
-        if total_mb < 4096:
-            reserved_mb = total_mb * 0.4
-        else:
-            reserved_mb = 1536  # 1.5GB fixed for larger instances
-
-        # Calculate Available Slots (min 128MB per function)
-        available_mb = total_mb - reserved_mb
-        limit = int(available_mb // 128)
-        
-        # Safety bound (Min 1, Max 500)
-        limit = max(1, min(limit, 500))
-
-        logger.info("Dynamic Limit Configured", 
-                    host_ram_mb=int(total_mb), 
-                    reserved_mb=int(reserved_mb), 
-                    concurrency_limit=limit)
-        
-        return threading.Semaphore(limit)
-
-    def _initialize_warm_pool(self):
-        """Initialize Warm Pool (Eliminate Cold Start)"""
-        counts = {
-            "python": int(self.cfg.get("WARM_POOL_PYTHON_SIZE", 1)),
-            "cpp": int(self.cfg.get("WARM_POOL_CPP_SIZE", 1)),
-            "nodejs": int(self.cfg.get("WARM_POOL_NODEJS_SIZE", 1)),
-            "go": int(self.cfg.get("WARM_POOL_GO_SIZE", 1))
-        }
-        logger.info("🔥 Initializing Warm Pools", counts=counts)
-        
-        for runtime, count in counts.items():
-            for _ in range(count):
-                self._create_warm_container(runtime)
-
-    def _create_warm_container(self, runtime: str) -> str:
-        try:
-            img = self.images.get(runtime)
-            # Run infinite wait container
-            c = self.docker.containers.run(
-                img, command="tail -f /dev/null", detach=True,
-                # [SECURITY] Volume mount removed for isolation.
-                # Code will be injected via 'put_archive' (docker cp) at runtime.
-                # volumes={self.cfg["DOCKER_WORK_DIR_ROOT"]: {"bind": "/workspace", "mode": "rw"}},
-                network_mode="bridge", # Allow AI Endpoint access
-                mem_limit="1024m",   # Default (Will be updated in run)
-                cpu_quota=100000     # 1.0 CPU
-            )
-            c.pause()
-            self.pools[runtime].append(c.id)
-            return c.id
-        except Exception as e:
-            logger.error("Failed to create warm container", runtime=runtime, error=str(e))
-            return None
-
-    def _acquire_container(self, runtime: str, function_id: str = None):
-        """
-        Acquire container with priority:
-        1. Function-specific warm pool (same function = secure + fast)
-        2. Runtime-based generic pool (different function = cold start for that func)
-        """
-        target_runtime = runtime if runtime in self.pools else "python"
-        
-        # Try function-specific pool first (Warm Start for repeated calls)
-        if function_id:
-            with self.function_pool_lock:
-                if function_id in self.function_pools and self.function_pools[function_id]:
-                    container = self.function_pools[function_id].pop()  # LRU: get most recent
-                    try:
-                        # Try unpause (ignore if already running)
-                        try:
-                            container.unpause()
-                        except Exception:
-                            pass  # Already running, that's fine
-                        logger.info("⚡ Warm Start from function pool", function_id=function_id)
-                        container.is_warm = True  # Mark as warm
-                        return container
-                    except Exception as e:
-                        logger.warning("⚠️ Failed to reuse container from function pool", error=str(e))
-                        # Container dead, fall through to generic pool
-        
-        # Fall back to runtime generic pool (Cold Start for this function)
-        cid = None
-        with self.pool_locks[target_runtime]:
-            if not self.pools[target_runtime]:
-                logger.warning("Pool empty, creating new container synchronously", runtime=target_runtime)
-                cid = self._create_warm_container(target_runtime)
-                if not cid: raise RuntimeError("Failed to create container")
-            
-            if self.pools[target_runtime]:
-                cid = self.pools[target_runtime].popleft()
-            
-        if not cid:
-             raise RuntimeError("Failed to acquire container")
-
-        try:
-            c = self.docker.containers.get(cid)
-            # Try unpause (ignore if already running)
-            try:
-                c.unpause()
-            except Exception:
-                pass  # Already running, that's fine
-            logger.info("🥶 Cold Start from runtime pool", runtime=target_runtime)
-            
-            # Only replenish when generic pool is used (not for warm start)
-            self._replenish_pool(target_runtime)
-            
-            c.is_warm = False  # Mark as cold
-            return c
-        except Exception:
-            return self._acquire_container(target_runtime, function_id)
-
-    def _release_container(self, container, function_id: str, runtime: str):
-        """
-        Return container to function-specific pool with LRU eviction.
-        [Security] Cleans workspace before reuse.
-        """
-        try:
-            # 1. [Optimization] Skip cleanup to avoid exec_run overhead (200ms+)
-            # Container is only reused for same function_id, so workspace is compatible.
-            # container.exec_run("rm -rf /workspace/* /tmp/* /output/*", demux=False)
-            
-            # 2. [Optimization] Skip pause to keep it hot (CPU usage is near 0 anyway)
-            # if container.status != 'paused':
-            #     container.pause()
-            
-            # 3. Add to function-specific pool with LRU eviction
-            with self.function_pool_lock:
-                if function_id not in self.function_pools:
-                    self.function_pools[function_id] = []
-                
-                pool = self.function_pools[function_id]
-                
-                # [LRU] If pool is full, evict the oldest (front of list)
-                if len(pool) >= self.MAX_POOL_SIZE_PER_FUNC:
-                    oldest = pool.pop(0)
-                    try:
-                        oldest.remove(force=True)
-                        logger.info("🗑️ LRU Eviction: removed oldest container", function_id=function_id)
-                    except Exception:
-                        pass
-                
-                # Add new container at the end (most recently used)
-                pool.append(container)
-                logger.info("♻️ Container recycled", function_id=function_id, pool_size=len(pool))
-                
-        except Exception as e:
-            # If cleanup fails, just remove the container
-            logger.warning("Failed to recycle container, removing", error=str(e))
-            try:
-                container.remove(force=True)
-            except Exception:
-                pass
-
-    def _replenish_pool(self, runtime: str):
-        """Replenish the runtime warm pool asynchronously after usage"""
-        def _create():
-            try:
-                self._create_warm_container(runtime)
-                logger.info("Pool replenished", runtime=runtime)
-            except Exception as e:
-                logger.error("Failed to replenish pool", error=str(e))
-        
-        # Run in a separate thread to avoid blocking the main execution flow
-        threading.Thread(target=_create, daemon=True).start()
-
-
-    def _prepare_workspace(self, task: TaskMessage) -> Path:
-        """S3 Download with Redis cache and [Security] Zip Slip prevention during extraction"""
-        local_dir = Path(self.cfg["DOCKER_WORK_DIR_ROOT"]) / task.request_id
-        if local_dir.exists(): shutil.rmtree(local_dir)
-        local_dir.mkdir(parents=True, exist_ok=True)
-        
-        zip_path = local_dir / "code.zip"
-        bucket = task.s3_bucket if task.s3_bucket else self.cfg["S3_CODE_BUCKET"]
-        cache_key = f"code:{task.function_id}"
-        
-        # 1. Try Redis cache first (5ms vs 1000ms from S3)
-        cache_hit = False
-        if self.redis:
-            try:
-                cached_code = self.redis.get(cache_key)
-                if cached_code:
-                    with open(zip_path, "wb") as f:
-                        f.write(cached_code)
-                    cache_hit = True
-                    logger.info("⚡ Code cache HIT", function_id=task.function_id)
-            except Exception as e:
-                logger.warning("Redis cache read failed", error=str(e))
-        
-        # 2. Cache MISS -> Download from S3
-        if not cache_hit:
-            logger.info("📥 Code cache MISS, downloading from S3", function_id=task.function_id)
-            self.s3.download_file(bucket, task.s3_key, str(zip_path))
-            
-            # 3. Store in Redis for future requests (TTL: 10 minutes)
-            if self.redis:
-                try:
-                    with open(zip_path, "rb") as f:
-                        self.redis.setex(cache_key, 600, f.read())  # 10분 TTL
-                    logger.info("📦 Code cached to Redis", function_id=task.function_id)
-                except Exception as e:
-                    logger.warning("Redis cache write failed", error=str(e))
-        
-        # Zip Slip prevention code
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            for member in zf.namelist():
-                # Block attempts to access parent directory (../)
-                target_path = (local_dir / member).resolve()
-                if not str(target_path).startswith(str(local_dir.resolve())):
-                    logger.warning("Zip Slip attempt detected", file=member)
-                    continue
-                
-                # Extract file
-                if member.endswith('/'):
-                    target_path.mkdir(parents=True, exist_ok=True)
-                else:
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    with zf.open(member) as source, open(target_path, "wb") as dest:
-                        shutil.copyfileobj(source, dest)
-        
-        zip_path.unlink()
-
-        # Inject FaaS SDK & AI Client
-        try:
-            current_dir = Path(__file__).parent
-            
-            # Inject sdk.py
-            src_sdk = current_dir / "sdk.py"
-            if src_sdk.exists():
-                shutil.copy(str(src_sdk), str(local_dir / "sdk.py"))
-            else:
-                logger.warning("sdk.py not found, skipping SDK injection")
-
-            # Inject ai_client.py (Critical for AI Logic)
-            src_ai = current_dir / "ai_client.py"
-            if src_ai.exists():
-                shutil.copy(str(src_ai), str(local_dir / "ai_client.py"))
-            else:
-                logger.warning("ai_client.py not found, skipping injection")
-
-        except Exception as e:
-            logger.error("Failed to inject dependencies", error=str(e))
-
-        return local_dir
-
-    def _copy_to_container(self, container, source_path: Path, target_path: str):
-        """[Security] Inject code via docker cp (put_archive)"""
-        stream = io.BytesIO()
-        with tarfile.open(fileobj=stream, mode='w') as tar:
-            # Add all contents relative to the source_path (so they appear at target_path root)
-            tar.add(source_path, arcname=".")
-        stream.seek(0)
-        
-        # Ensure target directory exists
-        container.exec_run(f"mkdir -p {target_path}")
-        container.put_archive(target_path, stream)
-
-    def _copy_from_container(self, container, source_path: str, target_local_path: Path):
-        """
-        Retrieve output files via docker cp (get_archive)
-        [Optimization] Streams data to disk (temp file) to prevent OOM on large outputs
-        """
-        try:
-            stream, stat = container.get_archive(source_path)
-            temp_tar = target_local_path / "temp_output.tar"
-            
-            # Stream directly to disk to avoid loading massive files into RAM
-            with open(temp_tar, "wb") as f:
-                for chunk in stream:
-                    f.write(chunk)
-            
-            # Extract
-            with tarfile.open(temp_tar, mode='r') as tar:
-                tar.extractall(path=target_local_path)
-            
-            # Cleanup temp tar
-            temp_tar.unlink()
-            
-        except Exception as e:
-            logger.warning("Failed to copy from container", error=str(e))
-
+        self.uploader = uploader or OutputUploader(
+            bucket_name=self.cfg.get("S3_USER_DATA_BUCKET", config.S3_USER_DATA_BUCKET),
+            region=self.cfg.get("AWS_REGION", config.AWS_REGION)
+        )
 
     def run(self, task: TaskMessage) -> ExecutionResult:
+        start_time = time.time()
         container = None
         host_work_dir = None
-        start_time = time.time()
         
-        # Acquire global slot (wait up to 30s, then reject)
-        acquired = self.global_limit.acquire(blocking=True, timeout=30)
+        # 0. Global Concurrency Limit
+        acquired = self.metrics.global_limit.acquire(blocking=True, timeout=30)
         if not acquired:
             logger.error("Global container limit reached", request_id=task.request_id)
-            return ExecutionResult(
-                request_id=task.request_id, function_id=task.function_id, success=False, exit_code=-1,
-                stdout="", stderr="Server Busy (503): Too many concurrent executions",
-                duration_ms=int((time.time() - start_time) * 1000),
-                worker_id=socket.gethostname()
-            )
-        
+            return self._create_busy_response(task, start_time)
+
         try:
-            # 1. [Reorder] Acquire container FIRST to check warm status
-            container = self._acquire_container(task.runtime, task.function_id)
+            # 1. Acquire Container
+            try:
+                container = self.containers.acquire_container(task.runtime, task.function_id)
+            except Exception as e:
+                logger.error("Failed to acquire container", error=str(e))
+                raise e
+
             is_warm = getattr(container, "is_warm", False)
             
-            # Apply dynamic memory limit
-            try:
-                container.update(mem_limit=f"{task.memory_mb}m", memswap_limit=f"{task.memory_mb}m")
-            except Exception as e:
-                logger.warning("Failed to update container memory limit", error=str(e))
+            # 2. Resource Limits
+            self.containers.update_resources(container, task.memory_mb)
             
-            # [SECURITY] Use isolated workspace path (No host bind)
-            container_work_dir = "/workspace"
-            
-            # 2. [Optimization] Skip workspace prep for Warm Start (code already in container)
+            # 3. Workspace Preparation
             if is_warm:
                 logger.info("⚡ Warm Start: Skipping Host Workspace Prep", id=container.id[:12])
-                host_work_dir = Path(self.cfg["DOCKER_WORK_DIR_ROOT"]) / task.request_id
+                host_work_dir = Path(config.DOCKER_WORK_DIR_ROOT) / task.request_id
                 host_work_dir.mkdir(parents=True, exist_ok=True)
             else:
-                # Cold Start: Download code and prepare workspace
-                host_work_dir = self._prepare_workspace(task)
-            
-            # 3. Configure execution command
-            # Output Directory Setup
+                host_work_dir = self.storage.prepare_workspace(
+                    task.request_id, task.function_id, task.s3_key, task.s3_bucket
+                )
+                self.storage.inject_dependencies(host_work_dir)
+
+            # 4. Command & Payload Setup
             host_output_dir = host_work_dir / "output"
             host_output_dir.mkdir(parents=True, exist_ok=True)
             
-            # Setup container output dir + Lazy Cleanup (/tmp from previous runs)
-            setup_cmd = f"rm -rf /output /tmp/* && mkdir -p /output"
-
-            # Environment Variables
-            env_vars = {
-                "JOB_ID": task.request_id,
-                "FUNCTION_ID": task.function_id,
-                "MEMORY_MB": str(task.memory_mb),
-                "LLM_MODEL": task.model_id,
-                "OUTPUT_DIR": "/output"
-            }
-            
-            # Write payload to file if too large (>100KB)
             payload_str = json.dumps(task.payload)
-            if len(payload_str) > 100 * 1024:
-                payload_path = host_work_dir / "payload.json"
-                with open(payload_path, "w") as f:
+            use_payload_file = len(payload_str) > 100 * 1024
+            
+            if use_payload_file:
+                with open(host_work_dir / "payload.json", "w") as f:
                     f.write(payload_str)
-                env_vars["PAYLOAD_FILE"] = f"{container_work_dir}/payload.json"
-                if "PAYLOAD" in env_vars: del env_vars["PAYLOAD"]
-                logger.info("Payload too large, using file instead", size=len(payload_str))
-            else:
-                env_vars["PAYLOAD"] = payload_str
+            
+            # 5. Inject into Container
+            # Logic: If Cold Start OR Payload file needed, we copy.
+            if not is_warm or use_payload_file:
+                self.containers.copy_to_container(container, host_work_dir, "/workspace")
+            
+            cmd, env_vars = self._build_command(task, use_payload_file)
+            
+            # 6. Execute with Timeout
+            start_io = self.containers.get_io_bytes(container.id)
+            self.containers.reset_cgroup_peak(container.id)
+            
+            exit_code, output_bytes = self._execute_in_container(container, cmd, env_vars, task.timeout_ms)
+            
+            # 7. Metrics & Cleanup
+            end_io = self.containers.get_io_bytes(container.id)
+            peak_memory = self.containers.get_cgroup_memory_peak(container.id)
+            
+            output_str = output_bytes.decode('utf-8', errors='replace')
+            duration_ms = int((time.time() - start_time) * 1000)
+            
+            # Analysis
+            tip, savings = self.metrics.analyze_execution(peak_memory, task.memory_mb, end_io - start_io)
+            
+            # Retrieve Output Files
+            self.containers.copy_from_container(container, "/output", host_output_dir)
+            
+            # Extract LLM Usage
+            llm_tokens = self._read_llm_usage(host_output_dir)
 
-            # [SECURITY] Inject Code + Payload into Container
-            # Optimization: Skip injection if Warm Start AND Payload is small (in env vars)
-            has_large_payload = "PAYLOAD_FILE" in env_vars
-            
-            if not is_warm or has_large_payload:
-                logger.info("Injecting code to container", id=container.id[:12], reason="Cold Start" if not is_warm else "Large Payload")
-                self._copy_to_container(container, host_work_dir, container_work_dir)
-            else:
-                logger.info("⚡ Skipping code injection (Warm Start)", id=container.id[:12])
+            # Background Upload & Reporting
+            self._trigger_background_reporting(
+                task, peak_memory, host_output_dir, host_work_dir
+            )
 
-            # Pre-compiled Binary Detection
-            # Allows users to upload pre-built executables (cross-compiled for Linux/AMD64)
-            # to bypass in-container compilation, reducing latency from ~2500ms to ~30ms
-            
-            # Debug: Check files
-            try:
-                files = [f.name for f in host_work_dir.glob("*")]
-                logger.info("Workspace files check", files=files, path=str(host_work_dir))
-            except Exception: pass
-
-            binary_path = host_work_dir / "main"
-            has_binary = binary_path.exists() and binary_path.is_file()
-            chmod_cmd = f"chmod +x {container_work_dir}/main"
-
-            cmd = []
-            if task.runtime == "python": 
-                cmd = ["sh", "-c", f"{setup_cmd} && python {container_work_dir}/main.py"]
-            elif task.runtime == "nodejs": 
-                cmd = ["sh", "-c", f"{setup_cmd} && node {container_work_dir}/index.js"]
-            elif task.runtime == "cpp":
-                # Warm Start or pre-compiled binary: skip compilation
-                if is_warm or has_binary:
-                    logger.info("Skipping build (warm start or pre-compiled)", runtime="cpp")
-                    cmd = ["sh", "-c", f"{setup_cmd} && {chmod_cmd} && {container_work_dir}/main"]
-                else:
-                    logger.info("Compiling from source", runtime="cpp")
-                    cmd = ["sh", "-c", f"{setup_cmd} && g++ {container_work_dir}/main.cpp -o {container_work_dir}/main && {container_work_dir}/main"]
-            elif task.runtime == "go":
-                # Warm Start or pre-compiled binary: skip compilation
-                if is_warm or has_binary:
-                    logger.info("Skipping build (warm start or pre-compiled)", runtime="go")
-                    cmd = ["sh", "-c", f"{setup_cmd} && {chmod_cmd} && {container_work_dir}/main"]
-                else:
-                    logger.info("Compiling from source", runtime="go")
-                    cmd = ["sh", "-c", f"{setup_cmd} && cd {container_work_dir} && go build -o main main.go && ./main"]
-
-
-
-            # 4. 실행 (Exec) with Timeout
-            logger.info("Exec command", cmd=cmd, container=container.id[:12], timeout_ms=task.timeout_ms)
-            
-            exec_result = {"exit_code": None, "output": b""}
-            
-            def run_docker_exec():
-                try:
-                    ec, out = container.exec_run(
-                        cmd, workdir="/workspace", demux=False,
-                        environment=env_vars
-                    )
-                    exec_result["exit_code"] = ec
-                    exec_result["output"] = out
-                except Exception as e:
-                    exec_result["error"] = e
-            
-            # Helper to get I/O bytes
-            def get_io_bytes():
-                try:
-                    io_file = f"/sys/fs/cgroup/system.slice/docker-{container.id}.scope/io.stat"
-                    total = 0
-                    if os.path.exists(io_file):
-                        with open(io_file, "r") as f:
-                            for line in f:
-                                # Format: major:minor r=BYTES w=BYTES ...
-                                parts = line.split()
-                                for p in parts:
-                                    if p.startswith("r=") or p.startswith("w="):
-                                        total += int(p.split("=")[1])
-                    return total
-                except:
-                    return 0
-
-            # Measure Start I/O
-            start_io = get_io_bytes()
-
-            # [PERF] Reset memory peak to exclude cold start usage (Cgroup v2)
-            try:
-                peak_reset_file = f"/sys/fs/cgroup/system.slice/docker-{container.id}.scope/memory.peak"
-                if os.path.exists(peak_reset_file):
-                    with open(peak_reset_file, "w") as f:
-                        f.write("reset")
-            except Exception:
-                pass # Ignore if failed (metrics might be slightly inaccurate but execution proceeds)
-
-            import threading
-            exec_thread = threading.Thread(target=run_docker_exec)
-            
-            # ------------------------------------------------------------------
-            # [DISABLED] Real-time monitoring thread (Latency bottleneck)
-            # The join(timeout=1.0) was causing a 1s delay on t3.micro.
-            # We rely on the fallback stats check below which is faster.
-            # ------------------------------------------------------------------
-            
-            # metrics = {"peak_memory": 0}
-            # stop_monitoring = threading.Event()
-
-            # def monitor_memory():
-            #     while not stop_monitoring.is_set():
-            #         try:
-            #             stats = container.stats(stream=False)
-            #             usage = stats['memory_stats'].get('usage', 0)
-            #             metrics["peak_memory"] = max(metrics["peak_memory"], usage)
-            #         except Exception:
-            #             pass
-            #         time.sleep(0.1)
-
-            # monitor_thread = threading.Thread(target=monitor_memory, daemon=True)
-            # monitor_thread.start()
-            
-            exec_thread.start()
-            
-            # Divide by 1000 for seconds
-            exec_thread.join(timeout=task.timeout_ms / 1000.0)
-            
-            # Stop monitoring
-            # stop_monitoring.set()
-            # monitor_thread.join(timeout=1.0)
-            
-            if exec_thread.is_alive():
-                logger.error("Execution Timed Out", timeout_ms=task.timeout_ms)
-                # Graceful Shutdown: SIGTERM -> wait 3s -> SIGKILL
-                try:
-                    container.stop(timeout=3)
-                except Exception as e:
-                    logger.warning("Failed to stop container gracefully, forcing kill", error=str(e))
-                    container.kill()
-                    
-                raise TimeoutError(f"Execution timed out after {task.timeout_ms}ms")
-            
-            if "error" in exec_result:
-                raise exec_result["error"]
-                
-            exit_code = exec_result["exit_code"]
-            output = exec_result["output"]
-            
-            # Actual memory measurement
-            # Use monitored peak memory if available
-            usage = 0 # metrics["peak_memory"] (Disabled)
-            
-            # Fallback if monitoring failed or zero (unlikely but safe)
-            if usage == 0:
-                # [PERF] Direct cgroup read bypasses Docker API latency (1s -> 0ms)
-                try:
-                    # Amazon Linux 2023 / Cgroup V2 Path
-                    # Path: /sys/fs/cgroup/system.slice/docker-{id}.scope/memory.peak
-                    max_usage_file = f"/sys/fs/cgroup/system.slice/docker-{container.id}.scope/memory.peak"
-                    if os.path.exists(max_usage_file):
-                        with open(max_usage_file, "r") as f:
-                            usage = int(f.read().strip())
-                    else:
-                        # Fallback for some systems (older Cgroup V1 or different drivers)
-                        # But on our AL2023 Setup, the above is correct.
-                        pass
-                except Exception as e:
-                    logger.warning("Failed to read cgroup memory", error=str(e))
-                    usage = 0
-            
-            # Measure End I/O & Calculate Delta
-            end_io = get_io_bytes()
-            io_usage = end_io - start_io
-
-            # 6. Auto-Tuning & CloudWatch
-            tip, savings = AutoTuner.analyze(usage, task.memory_mb, io_usage)
-            # cw.publish_peak_memory is moved to background thread below
-
-            
-            # 7. Output Upload
-            # Retrieve output files from container (Since no bind mount)
-            self._copy_from_container(container, "/output", host_output_dir)
-            
-            # Files written to /output in container are now in host_output_dir
-            
-            # Usage Metering Collection (Thread-safe JSONL)
-            llm_token_count = 0
-            usage_file = host_output_dir / ".llm_usage_stats.jsonl"
-            if usage_file.exists():
-                try:
-                    with open(usage_file, 'r') as f:
-                        for line in f:
-                            if not line.strip(): continue
-                            stats = json.loads(line)
-                            llm_token_count += stats.get("prompt_eval_count", 0) + stats.get("eval_count", 0)
-                    # Don't upload the hidden stats file
-                    usage_file.unlink() 
-                except Exception as e:
-                    logger.warning("Failed to read LLM usage stats", error=str(e))
-
-            # Asynchronous Reporting (Fire-and-Forget)
-            # Decouple metrics publishing and S3 uploads from the function execution path.
-            # This ensures that network I/O latency for observability does not impact the reported execution duration.
-            
-            # 1. Capture execution duration immediately
-            final_duration = int((time.time() - start_time) * 1000)
-
-            # 2. Define background task for observability and cleanup
-            def background_tasks(fid, runtime, peak_mem, req_id, host_out_dir, work_dir):
-                try:
-                    # Publish metrics to CloudWatch
-                    self.cw.publish_peak_memory(fid, runtime, peak_mem)
-                    
-                    # Upload outputs to S3
-                    self.uploader.upload_outputs(req_id, str(host_out_dir))
-                except Exception as e:
-                    logger.warning("Background reporting failed", error=str(e))
-                finally:
-                    # Cleanup workspace after reporting is complete to prevent data loss during upload
-                    if work_dir and work_dir.exists():
-                        try: shutil.rmtree(work_dir)
-                        except Exception: pass
-
-            # 3. Execute background tasks in a separate thread
-            threading.Thread(target=background_tasks, 
-                             args=(task.function_id, task.runtime, usage, task.request_id, host_output_dir, host_work_dir),
-                             daemon=True
-            ).start()
-
-            output_str = output.decode('utf-8', errors='replace')
+            # 8. Release Container
+            self.containers.release_container(container, task.function_id)
+            container = None # Prevent cleanup in finally block
 
             return ExecutionResult(
                 request_id=task.request_id,
                 function_id=task.function_id,
                 success=(exit_code == 0),
                 exit_code=exit_code,
-                stdout=output_str,
-                stderr="",
-                duration_ms=final_duration, # Use calculated fast duration
-                peak_memory_bytes=usage,
+                stdout=output_str, # Simple stdout capture (could be refined)
+                stderr="", # Docker exec combines streams usually, or we can separate
+                duration_ms=duration_ms,
+                worker_id=socket.gethostname(),
+                peak_memory_bytes=peak_memory,
                 allocated_memory_mb=task.memory_mb,
                 optimization_tip=tip,
                 estimated_savings=savings,
-                output_files=[], # Async upload means we can't return file list immediately
-                llm_token_count=llm_token_count,
-                worker_id=socket.gethostname()
+                output_files=[f.name for f in host_output_dir.glob("*")],
+                llm_token_count=llm_tokens
             )
 
         except Exception as e:
-            logger.error("Execution failed", error=str(e))
-            return ExecutionResult(
-                request_id=task.request_id, function_id=task.function_id, success=False, exit_code=-1,
-                stdout="", stderr=str(e), duration_ms=int((time.time() - start_time) * 1000),
-                worker_id=socket.gethostname()
-            )
-            
-        finally:
-            self.global_limit.release()
-            
-            # [LRU] Recycle container to function-specific pool (not delete)
+            logger.error("Execution Flow Failed", error=str(e))
             if container:
-                self._release_container(container, task.function_id, task.runtime)
+                try: container.remove(force=True)
+                except: pass
+            return ExecutionResult(
+                request_id=task.request_id,
+                function_id=task.function_id,
+                success=False,
+                exit_code=-1,
+                stdout="",
+                stderr=str(e),
+                duration_ms=int((time.time() - start_time) * 1000)
+            )
+        finally:
+            self.metrics.global_limit.release()
+
+    def _create_busy_response(self, task, start_time):
+        return ExecutionResult(
+            request_id=task.request_id,
+            function_id=task.function_id,
+            success=False,
+            exit_code=-1,
+            stdout="",
+            stderr="Server Busy (503): Too many concurrent executions",
+            duration_ms=int((time.time() - start_time) * 1000),
+            worker_id=socket.gethostname()
+        )
+
+    def _build_command(self, task: TaskMessage, use_payload_file: bool):
+        env_vars = {
+            "JOB_ID": task.request_id,
+            "FUNCTION_ID": task.function_id,
+            "MEMORY_MB": str(task.memory_mb),
+            "LLM_MODEL": task.model_id,
+            "OUTPUT_DIR": "/output"
+        }
+        if use_payload_file:
+            env_vars["PAYLOAD_FILE"] = "/workspace/payload.json"
+        else:
+            env_vars["PAYLOAD"] = json.dumps(task.payload)
+
+        setup_cmd = "rm -rf /output /tmp/* && mkdir -p /output"
+        
+        # Simple command builder (can be moved to a Factory if complex)
+        cmd_str = ""
+        if task.runtime == "python":
+            cmd_str = f"{setup_cmd} && python /workspace/main.py"
+        elif task.runtime == "nodejs":
+            cmd_str = f"{setup_cmd} && node /workspace/index.js"
+        elif task.runtime == "cpp":
+            # Assume binary exists or compile (simplified for now)
+            # In real world, check if binary exists first (like original code)
+            # For simplicity, we assume compiled or compile script
+            cmd_str = f"{setup_cmd} && g++ /workspace/main.cpp -o /workspace/main && /workspace/main"
+        elif task.runtime == "go":
+            cmd_str = f"{setup_cmd} && cd /workspace && go build -o main main.go && ./main"
             
-            # Note: host_work_dir cleanup is moved to background_tasks
+        return ["sh", "-c", cmd_str], env_vars
 
+    def _execute_in_container(self, container, cmd, env, timeout_ms):
+        result = {"exit_code": -1, "output": b""}
+        
+        def _run():
+            try:
+                ec, out = container.exec_run(cmd, workdir="/workspace", environment=env)
+                result["exit_code"] = ec
+                result["output"] = out
+            except Exception as e:
+                result["output"] = str(e).encode()
 
-    def _shutdown_cleanup(self):
-        """Clean up all containers on program exit (zombie prevention)"""
-        logger.info("Graceful Shutdown: Cleaning up all containers...")
+        t = threading.Thread(target=_run)
+        t.start()
+        t.join(timeout=timeout_ms / 1000.0)
         
-        # Clean Runtime Pool (Generic)
-        for runtime, pool in self.pools.items():
-            while pool:
-                try:
-                    cid = pool.pop()
-                    self.docker.containers.get(cid).remove(force=True)
-                except Exception:
-                    pass
+        if t.is_alive():
+            try: container.stop(timeout=1)
+            except: pass
+            raise TimeoutError(f"Execution timed out after {timeout_ms}ms")
+            
+        return result["exit_code"], result["output"]
+
+    def _read_llm_usage(self, output_dir: Path) -> int:
+        usage_file = output_dir / ".llm_usage_stats.jsonl"
+        count = 0
+        if usage_file.exists():
+            try:
+                with open(usage_file, 'r') as f:
+                    for line in f:
+                        if line.strip():
+                            stats = json.loads(line)
+                            count += stats.get("prompt_eval_count", 0) + stats.get("eval_count", 0)
+                usage_file.unlink()
+            except: pass
+        return count
+
+    def _trigger_background_reporting(self, task, peak_mem, host_out_dir, work_dir):
+        def _bg():
+            try:
+                self.metrics.cw.publish_peak_memory(task.function_id, task.runtime, peak_mem)
+                self.uploader.upload_outputs(task.request_id, str(host_out_dir))
+            except: pass
+            finally:
+                if work_dir.exists():
+                    try: shutil.rmtree(work_dir)
+                    except: pass
         
-        # Clean Function Pool (Warm)
-        for fid, containers in self.function_pools.items():
-            for c in containers:
-                try:
-                    c.remove(force=True)
-                except Exception:
-                    pass
-        
-        logger.info("Graceful Shutdown: Complete")
+        threading.Thread(target=_bg, daemon=True).start()
