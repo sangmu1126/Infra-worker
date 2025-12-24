@@ -260,9 +260,9 @@ class TaskExecutor:
                 if function_id in self.function_pools and self.function_pools[function_id]:
                     container = self.function_pools[function_id].pop()  # LRU: get most recent
                     try:
-                        # [Optimization] Skip unpause for speed
-                        # if container.status == 'paused':
-                        #     container.unpause()
+                        # Unpause if needed (handle legacy paused containers)
+                        if container.status == 'paused':
+                            container.unpause()
                         logger.info("⚡ Warm Start from function pool", function_id=function_id)
                         container.is_warm = True  # Mark as warm
                         return container
@@ -285,9 +285,9 @@ class TaskExecutor:
 
         try:
             c = self.docker.containers.get(cid)
-            # [Optimization] Skip unpause
-            # if c.status == 'paused':
-            #    c.unpause()
+            # Unpause if needed (handle legacy paused containers)
+            if c.status == 'paused':
+                c.unpause()
             logger.info("🥶 Cold Start from runtime pool", runtime=target_runtime)
             
             # Only replenish when generic pool is used (not for warm start)
