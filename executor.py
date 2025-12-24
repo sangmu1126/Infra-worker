@@ -574,15 +574,36 @@ class TaskExecutor:
             else:
                 logger.info("⚡ Skipping code injection (Warm Start)", id=container.id[:12])
 
+            # Pre-compiled Binary Detection
+            # Allows users to upload pre-built executables (cross-compiled for Linux/AMD64)
+            # to bypass in-container compilation, reducing latency from ~2500ms to ~30ms
+            binary_path = host_work_dir / "main"
+            has_binary = binary_path.exists() and binary_path.is_file()
+            chmod_cmd = f"chmod +x {container_work_dir}/main"
+
             cmd = []
             if task.runtime == "python": 
                 cmd = ["sh", "-c", f"{setup_cmd} && python {container_work_dir}/main.py"]
-            elif task.runtime == "cpp":  
-                cmd = ["sh", "-c", f"{setup_cmd} && g++ {container_work_dir}/main.cpp -o {container_work_dir}/out && {container_work_dir}/out"]
             elif task.runtime == "nodejs": 
                 cmd = ["sh", "-c", f"{setup_cmd} && node {container_work_dir}/index.js"]
+            elif task.runtime == "cpp":
+                # Warm Start or pre-compiled binary: skip compilation
+                if is_warm or has_binary:
+                    logger.info("Skipping build (warm start or pre-compiled)", runtime="cpp")
+                    cmd = ["sh", "-c", f"{setup_cmd} && {chmod_cmd} && {container_work_dir}/main"]
+                else:
+                    logger.info("Compiling from source", runtime="cpp")
+                    cmd = ["sh", "-c", f"{setup_cmd} && g++ {container_work_dir}/main.cpp -o {container_work_dir}/main && {container_work_dir}/main"]
             elif task.runtime == "go":
-                cmd = ["sh", "-c", f"{setup_cmd} && cd {container_work_dir} && go build -o main main.go && ./main"]
+                # Warm Start or pre-compiled binary: skip compilation
+                if is_warm or has_binary:
+                    logger.info("Skipping build (warm start or pre-compiled)", runtime="go")
+                    cmd = ["sh", "-c", f"{setup_cmd} && {chmod_cmd} && {container_work_dir}/main"]
+                else:
+                    logger.info("Compiling from source", runtime="go")
+                    cmd = ["sh", "-c", f"{setup_cmd} && cd {container_work_dir} && go build -o main main.go && ./main"]
+
+
 
             # 4. 실행 (Exec) with Timeout
             logger.info("Exec command", cmd=cmd, container=container.id[:12], timeout_ms=task.timeout_ms)
