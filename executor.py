@@ -77,11 +77,12 @@ class AutoTuner:
     COST_PER_MB_HOUR = 0.00005  # $0.00005 (Estimated based on loose AWS EC2 GB-hour cost)
 
     @staticmethod
-    def analyze(peak_bytes: int, allocated_mb: int):
+    def analyze(peak_bytes: int, allocated_mb: int, io_bytes: int = 0):
         if not peak_bytes: return None, None
         if allocated_mb <= 0: allocated_mb = 128  # Guard against division by zero
 
         peak_mb = peak_bytes / (1024 * 1024)
+        io_mb = io_bytes / (1024 * 1024)
         
         # 1. Generate Tip
         tip = None
@@ -94,6 +95,13 @@ class AutoTuner:
         elif ratio > 0.9:
             rec = int(peak_mb * 1.2)
             tip = f"⚠️ Warning: Memory tight ({int(peak_mb)}MB). Recommend increasing to {rec}MB+."
+        elif allocated_mb <= 128 and ratio > 0.5:
+            # [UX] Reassure user that 70-80MB usage on 128MB container is normal overhead
+            tip = f"💡 Tip: 초기화(Init) 과정을 제외하면 실제 코드는 훨씬 적은 메모리를 사용합니다. 하지만 안정적인 실행을 위해 현재 수준({allocated_mb}MB)을 유지하는 것을 권장합니다."
+        
+        # 1.1 I/O Check
+        if not tip and io_mb > 50: # If > 50MB I/O
+             tip = f"⚠️ High I/O ({int(io_mb)}MB) detected. Consider caching data or reducing file operations to improve latency."
 
         # 2. Calculate Cost Savings (Business Perspective)
         # Logic: Calculate wasted resources (Allocated - Peak) to highlight inefficiency
@@ -627,6 +635,26 @@ class TaskExecutor:
                     exec_result["output"] = out
                 except Exception as e:
                     exec_result["error"] = e
+            
+            # Helper to get I/O bytes
+            def get_io_bytes():
+                try:
+                    io_file = f"/sys/fs/cgroup/system.slice/docker-{container.id}.scope/io.stat"
+                    total = 0
+                    if os.path.exists(io_file):
+                        with open(io_file, "r") as f:
+                            for line in f:
+                                # Format: major:minor r=BYTES w=BYTES ...
+                                parts = line.split()
+                                for p in parts:
+                                    if p.startswith("r=") or p.startswith("w="):
+                                        total += int(p.split("=")[1])
+                    return total
+                except:
+                    return 0
+
+            # Measure Start I/O
+            start_io = get_io_bytes()
 
             # [PERF] Reset memory peak to exclude cold start usage (Cgroup v2)
             try:
@@ -710,8 +738,12 @@ class TaskExecutor:
                     logger.warning("Failed to read cgroup memory", error=str(e))
                     usage = 0
             
+            # Measure End I/O & Calculate Delta
+            end_io = get_io_bytes()
+            io_usage = end_io - start_io
+
             # 6. Auto-Tuning & CloudWatch
-            tip, savings = AutoTuner.analyze(usage, task.memory_mb)
+            tip, savings = AutoTuner.analyze(usage, task.memory_mb, io_usage)
             # cw.publish_peak_memory is moved to background thread below
 
             
