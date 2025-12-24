@@ -628,6 +628,15 @@ class TaskExecutor:
                 except Exception as e:
                     exec_result["error"] = e
 
+            # [PERF] Reset memory peak to exclude cold start usage (Cgroup v2)
+            try:
+                peak_reset_file = f"/sys/fs/cgroup/system.slice/docker-{container.id}.scope/memory.peak"
+                if os.path.exists(peak_reset_file):
+                    with open(peak_reset_file, "w") as f:
+                        f.write("reset")
+            except Exception:
+                pass # Ignore if failed (metrics might be slightly inaccurate but execution proceeds)
+
             import threading
             exec_thread = threading.Thread(target=run_docker_exec)
             
@@ -685,8 +694,7 @@ class TaskExecutor:
             
             # Fallback if monitoring failed or zero (unlikely but safe)
             if usage == 0:
-                # [OPTIMIZATION] Direct Cgroup Read (0ms Overhead vs 1000ms via Docker API)
-                # Instead of asking Docker Daemon, we peek at the kernel's ledger directly.
+                # [PERF] Direct cgroup read bypasses Docker API latency (1s -> 0ms)
                 try:
                     # Amazon Linux 2023 / Cgroup V2 Path
                     # Path: /sys/fs/cgroup/system.slice/docker-{id}.scope/memory.peak
