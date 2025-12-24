@@ -693,7 +693,8 @@ class TaskExecutor:
             
             # 6. Auto-Tuning & CloudWatch
             tip, savings = AutoTuner.analyze(usage, task.memory_mb)
-            self.cw.publish_peak_memory(task.function_id, task.runtime, usage)
+            # cw.publish_peak_memory is moved to background thread below
+
             
             # 7. Output Upload
             # Retrieve output files from container (Since no bind mount)
@@ -716,7 +717,34 @@ class TaskExecutor:
                 except Exception as e:
                     logger.warning("Failed to read LLM usage stats", error=str(e))
 
-            output_files = self.uploader.upload_outputs(task.request_id, str(host_output_dir))
+            # Asynchronous Reporting (Fire-and-Forget)
+            # Decouple metrics publishing and S3 uploads from the function execution path.
+            # This ensures that network I/O latency for observability does not impact the reported execution duration.
+            
+            # 1. Capture execution duration immediately
+            final_duration = int((time.time() - start_time) * 1000)
+
+            # 2. Define background task for observability and cleanup
+            def background_tasks(fid, runtime, peak_mem, req_id, host_out_dir, work_dir):
+                try:
+                    # Publish metrics to CloudWatch
+                    self.cw.publish_peak_memory(fid, runtime, peak_mem)
+                    
+                    # Upload outputs to S3
+                    self.uploader.upload_outputs(req_id, str(host_out_dir))
+                except Exception as e:
+                    logger.warning("Background reporting failed", error=str(e))
+                finally:
+                    # Cleanup workspace after reporting is complete to prevent data loss during upload
+                    if work_dir and work_dir.exists():
+                        try: shutil.rmtree(work_dir)
+                        except Exception: pass
+
+            # 3. Execute background tasks in a separate thread
+            threading.Thread(target=background_tasks, 
+                             args=(task.function_id, task.runtime, usage, task.request_id, host_output_dir, host_work_dir),
+                             daemon=True
+            ).start()
 
             output_str = output.decode('utf-8', errors='replace')
 
@@ -727,12 +755,12 @@ class TaskExecutor:
                 exit_code=exit_code,
                 stdout=output_str,
                 stderr="",
-                duration_ms=int((time.time() - start_time) * 1000),
+                duration_ms=final_duration, # Use calculated fast duration
                 peak_memory_bytes=usage,
                 allocated_memory_mb=task.memory_mb,
                 optimization_tip=tip,
                 estimated_savings=savings,
-                output_files=output_files,
+                output_files=[], # Async upload means we can't return file list immediately
                 llm_token_count=llm_token_count,
                 worker_id=socket.gethostname()
             )
@@ -752,10 +780,8 @@ class TaskExecutor:
             if container:
                 self._release_container(container, task.function_id, task.runtime)
             
-            # Clean up files
-            if host_work_dir and host_work_dir.exists():
-                try: shutil.rmtree(host_work_dir)
-                except Exception: pass
+            # Note: host_work_dir cleanup is moved to background_tasks
+
 
     def _shutdown_cleanup(self):
         """Clean up all containers on program exit (zombie prevention)"""
