@@ -577,6 +577,13 @@ class TaskExecutor:
             # Pre-compiled Binary Detection
             # Allows users to upload pre-built executables (cross-compiled for Linux/AMD64)
             # to bypass in-container compilation, reducing latency from ~2500ms to ~30ms
+            
+            # Debug: Check files
+            try:
+                files = [f.name for f in host_work_dir.glob("*")]
+                logger.info("Workspace files check", files=files, path=str(host_work_dir))
+            except Exception: pass
+
             binary_path = host_work_dir / "main"
             has_binary = binary_path.exists() and binary_path.is_file()
             chmod_cmd = f"chmod +x {container_work_dir}/main"
