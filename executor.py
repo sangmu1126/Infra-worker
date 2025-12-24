@@ -172,6 +172,16 @@ class TaskExecutor:
             k: threading.Lock() for k in ["python", "cpp", "nodejs", "go"]
         }
         
+        # [Pre-pull] Ensure all images are available before first request
+        logger.info("🐳 Pre-pulling Docker images...")
+        for runtime, img_name in self.images.items():
+            try:
+                self.docker.images.get(img_name)
+                logger.debug(f"✓ Image ready: {img_name}")
+            except docker.errors.ImageNotFound:
+                logger.info(f"📥 Pulling image: {img_name}")
+                self.docker.images.pull(img_name)
+        
         self._initialize_warm_pool()
         
         # Dynamic global concurrency limiter (based on host RAM)
