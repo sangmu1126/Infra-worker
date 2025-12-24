@@ -320,7 +320,7 @@ class TaskExecutor:
                     try:
                         oldest.remove(force=True)
                         logger.info("🗑️ LRU Eviction: removed oldest container", function_id=function_id)
-                    except:
+                    except Exception:
                         pass
                 
                 # Add new container at the end (most recently used)
@@ -332,7 +332,7 @@ class TaskExecutor:
             logger.warning("Failed to recycle container, removing", error=str(e))
             try:
                 container.remove(force=True)
-            except:
+            except Exception:
                 pass
 
     def _replenish_pool(self, runtime: str):
@@ -544,7 +544,7 @@ class TaskExecutor:
                         # Optional: Subtract cache if needed
                         # usage -= stats['memory_stats'].get('stats', {}).get('cache', 0)
                         metrics["peak_memory"] = max(metrics["peak_memory"], usage)
-                    except:
+                    except Exception:
                         pass
                     time.sleep(0.1) # Poll every 100ms
 
@@ -657,7 +657,7 @@ class TaskExecutor:
             # Clean up files
             if host_work_dir and host_work_dir.exists():
                 try: shutil.rmtree(host_work_dir)
-                except: pass
+                except Exception: pass
 
     def _shutdown_cleanup(self):
         """Clean up all containers on program exit (zombie prevention)"""
@@ -669,7 +669,7 @@ class TaskExecutor:
                 try:
                     cid = pool.pop()
                     self.docker.containers.get(cid).remove(force=True)
-                except:
+                except Exception:
                     pass
         
         # Clean Function Pool (Warm)
@@ -677,7 +677,7 @@ class TaskExecutor:
             for c in containers:
                 try:
                     c.remove(force=True)
-                except:
+                except Exception:
                     pass
         
         logger.info("Graceful Shutdown: Complete")
