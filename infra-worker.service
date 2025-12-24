@@ -7,9 +7,9 @@ Requires=docker.service
 Type=simple
 User=ec2-user
 Group=ec2-user
-WorkingDirectory=/home/ec2-user/infra-worker
+WorkingDirectory=/home/ec2-user/faas-worker
 EnvironmentFile=/etc/infra/worker.env
-ExecStart=/usr/bin/python3 /home/ec2-user/infra-worker/agent.py
+ExecStart=/usr/bin/python3 /home/ec2-user/faas-worker/agent.py
 Restart=always
 RestartSec=10
 # 로그 설정
