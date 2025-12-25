@@ -201,12 +201,10 @@ class TaskExecutor:
         elif task.runtime == "nodejs":
             cmd_str = f"{setup_cmd} && node /workspace/index.js"
         elif task.runtime == "cpp":
-            # Assume binary exists or compile (simplified for now)
-            # In real world, check if binary exists first (like original code)
-            # For simplicity, we assume compiled or compile script
-            cmd_str = f"{setup_cmd} && g++ /workspace/main.cpp -o /workspace/main && /workspace/main"
+            # Optimized: Check if binary exists (Warm Start), else compile (Cold Start)
+            cmd_str = f"{setup_cmd} && if [ -f /workspace/main ]; then /workspace/main; else g++ /workspace/main.cpp -o /workspace/main && /workspace/main; fi"
         elif task.runtime == "go":
-            cmd_str = f"{setup_cmd} && cd /workspace && go build -o main main.go && ./main"
+            cmd_str = f"{setup_cmd} && cd /workspace && if [ -f main ]; then ./main; else go build -o main main.go && ./main; fi"
             
         return ["sh", "-c", cmd_str], env_vars
 
