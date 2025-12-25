@@ -198,9 +198,9 @@ class TaskExecutor:
             cmd_str = f"{setup_cmd} && node /workspace/index.js"
         elif task.runtime == "cpp":
             # Optimized: Check if binary exists (Warm Start), else compile (Cold Start)
-            cmd_str = f"{setup_cmd} && if [ -f /workspace/main ]; then /workspace/main; else g++ /workspace/main.cpp -o /workspace/main && /workspace/main; fi"
+            cmd_str = f"{setup_cmd} && if [ -f /workspace/main ]; then chmod +x /workspace/main && /workspace/main; else g++ /workspace/main.cpp -o /workspace/main && /workspace/main; fi"
         elif task.runtime == "go":
-            cmd_str = f"{setup_cmd} && cd /workspace && if [ -f main ]; then ./main; else go build -o main main.go && ./main; fi"
+            cmd_str = f"{setup_cmd} && cd /workspace && if [ -f main ]; then chmod +x main && ./main; else go build -o main main.go && ./main; fi"
             
         return ["sh", "-c", cmd_str], env_vars
 
