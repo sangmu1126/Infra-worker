@@ -4,9 +4,11 @@ import time
 import threading
 import signal
 import sys
+import socket
 import boto3
 import redis
 import structlog
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 from prometheus_client import start_http_server, Counter, Histogram, Gauge
 
@@ -43,6 +45,7 @@ class InfraAgent:
         # Execution engine (includes Warm Pool)
         self.executor = TaskExecutor(self.config)
         self.running = True
+        self._start_time = time.time()  # For uptime tracking
 
         # Prometheus Metrics
         self.jobs_processed = Counter('worker_jobs_processed_total', 'Total jobs processed', ['status', 'runtime', 'model'])
@@ -69,6 +72,9 @@ class InfraAgent:
 
         # Start System Status Publisher (Background Thread)
         threading.Thread(target=self._publish_system_status, daemon=True).start()
+        
+        # Start Health Check Server (port 8001)
+        threading.Thread(target=self._start_health_server, daemon=True).start()
 
         while self.running:
             try:
@@ -190,6 +196,49 @@ class InfraAgent:
                 logger.warning("Failed to publish system status", error=str(e))
             
             time.sleep(2)
+
+    def _start_health_server(self):
+        """Start a simple HTTP health check server on port 8001"""
+        agent = self
+        
+        class HealthHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/health" or self.path == "/":
+                    try:
+                        health_status = {
+                            "status": "healthy" if agent.running else "stopping",
+                            "worker_id": socket.gethostname(),
+                            "uptime_seconds": int(time.time() - agent._start_time),
+                            "pools": {
+                                "python": len(agent.executor.containers.pools["python"]),
+                                "nodejs": len(agent.executor.containers.pools["nodejs"]),
+                                "cpp": len(agent.executor.containers.pools["cpp"]),
+                                "go": len(agent.executor.containers.pools["go"])
+                            },
+                            "active_jobs": agent.active_jobs._value.get()
+                        }
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps(health_status).encode())
+                    except Exception as e:
+                        self.send_response(500)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode())
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            
+            def log_message(self, format, *args):
+                pass  # Suppress access logs
+        
+        try:
+            server = HTTPServer(("0.0.0.0", 8001), HealthHandler)
+            logger.info("🏥 Health Check Server Started", port=8001, endpoint="/health")
+            server.serve_forever()
+        except Exception as e:
+            logger.error("Failed to start health check server", error=str(e))
 
 
 if __name__ == "__main__":
