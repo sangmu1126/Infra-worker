@@ -151,6 +151,44 @@ Infra-worker/
 
 ---
 
+## 🧩 Usage Example
+
+### Job Payload (JSON)
+Task definition included in SQS message.
+
+```json
+{
+  "requestId": "job-12345",
+  "functionId": "func-abc",
+  "runtime": "python",
+  "s3Key": "users/user1/code.zip",
+  "s3Bucket": "my-code-bucket",
+  "memoryMb": 256,
+  "timeoutMs": 10000,
+  "input": {
+    "key1": "value1"
+  }
+}
+```
+
+### Redis Result (Channel: `result:job-12345`)
+```json
+{
+  "requestId": "job-12345",
+  "status": "SUCCESS",
+  "exitCode": 0,
+  "stdout": "Hello World",
+  "durationMs": 1250,
+  "peakMemoryBytes": 15728640,
+  "optimizationTip": "💡 Tip: Usage (15MB) < Limit (256MB)...",
+  "outputFiles": [
+    "https://s3.ap-northeast-2.amazonaws.com/my-bucket/outputs/job-12345/result.png"
+  ]
+}
+```
+
+---
+
 <div align="center">
   <sub>Built with ❤️ by Softbank-Final Team</sub>
 </div>
