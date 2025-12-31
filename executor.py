@@ -223,28 +223,21 @@ class TaskExecutor:
         if cmd[0] == "sh" and cmd[1] == "-c":
              final_cmd = ["sh", "-c", f"{{ {cmd[2]} ; }} ; echo $? > /workspace/exit_code.txt"]
 
-        def _run_streaming():
-             try:
-                 exec_result = container.exec_run(final_cmd, workdir="/workspace", environment=env, stream=True)
-                 
-                 if isinstance(exec_result, tuple):
-                     stream = exec_result[1]
-                 else:
-                     stream = exec_result
-                 
-                 with open(log_file, "wb") as f:
-                     for chunk in stream:
-                         if chunk:
-                             f.write(chunk)
-                     f.flush()
-                     os.fsync(f.fileno())  # Force write to disk
-             except Exception as e:
-                 logger.error("Stream error", error=str(e))
-                 with open(log_file, "ab") as f:
-                     f.write(f"\n[System Error] {str(e)}".encode())
-                     f.flush()
+        # Simple non-streaming execution (reliable for outputs < MAX_OUTPUT_SIZE)
+        def _run_exec():
+            try:
+                exec_result = container.exec_run(final_cmd, workdir="/workspace", environment=env, stream=False)
+                with open(log_file, "wb") as f:
+                    if exec_result.output:
+                        f.write(exec_result.output)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except Exception as e:
+                logger.error("Exec error", error=str(e))
+                with open(log_file, "wb") as f:
+                    f.write(f"[Execution Error] {str(e)}".encode())
 
-        t = threading.Thread(target=_run_streaming)
+        t = threading.Thread(target=_run_exec)
         t.start()
         t.join(timeout=timeout_ms / 1000.0)
         
