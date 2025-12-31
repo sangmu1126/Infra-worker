@@ -183,6 +183,14 @@ class TaskExecutor:
             "LLM_MODEL": task.model_id,
             "OUTPUT_DIR": "/output"
         }
+        
+        # Merge user-defined environment variables
+        if task.env_vars:
+            for key, value in task.env_vars.items():
+                # Don't allow overwriting system variables
+                if key not in env_vars:
+                    env_vars[key] = str(value)
+        
         if use_payload_file:
             env_vars["PAYLOAD_FILE"] = "/workspace/payload.json"
         else:

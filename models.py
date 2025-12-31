@@ -13,6 +13,7 @@ class TaskMessage:
     timeout_ms: int = 300000
     payload: Dict = field(default_factory=dict)
     model_id: str = "llama3:8b"
+    env_vars: Dict[str, str] = field(default_factory=dict)
 
 @dataclass
 class ExecutionResult:

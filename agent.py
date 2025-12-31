@@ -112,7 +112,8 @@ class InfraAgent:
                 memory_mb=body.get("memoryMb", 128),
                 timeout_ms=body.get("timeoutMs", 300000),
                 payload=body.get("input", {}),
-                model_id=body.get("modelId", "llama3:8b")
+                model_id=body.get("modelId", "llama3:8b"),
+                env_vars=body.get("envVars", {})
             )
             
             logger.info("🚀 Processing Task", id=task.request_id, runtime=task.runtime)
