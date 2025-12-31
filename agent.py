@@ -78,7 +78,7 @@ class InfraAgent:
 
         while self.running:
             try:
-                # 1. SQS Long Polling
+                # SQS Poll
                 resp = self.sqs.receive_message(
                     QueueUrl=queue_url,
                     MaxNumberOfMessages=10, # Batch fetching (Parallelism key)
@@ -118,7 +118,7 @@ class InfraAgent:
             
             logger.info("🚀 Processing Task", id=task.request_id, runtime=task.runtime)
 
-            # 2. Execute task (using Warm Pool)
+            # Execute Task
             result = None
             max_attempts = 3
             for attempt in range(max_attempts):
@@ -131,7 +131,7 @@ class InfraAgent:
                         raise e
                     time.sleep(1)
 
-            # 3. Publish result to Redis (Pub/Sub + KV storage)
+            # Publish Result
             result_dict = result.to_dict()
             json_result = json.dumps(result_dict)
             
@@ -150,7 +150,7 @@ class InfraAgent:
                         raise e
                     time.sleep(1)
 
-            # 4. Delete SQS message (Successful processing)
+            # Delete Message
             self.sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
             
             logger.info("✅ Task Completed", id=task.request_id, ms=result.duration_ms)
@@ -176,7 +176,6 @@ class InfraAgent:
         """
         while self.running:
             try:
-                # 1. Collect current metrics
                 status = {
                     "timestamp": time.time(),
                     "worker_id": self.config.get("HOSTNAME", "unknown"),
@@ -189,8 +188,7 @@ class InfraAgent:
                     "active_jobs": self.active_jobs._value.get()
                 }
                 
-                # 2. Publish to Redis (Key: 'system:status', TTL: 10s)
-                # Overwrites the key to keep the latest status only.
+                # Publish to Redis
                 self.redis_client.setex("system:status", 10, json.dumps(status))
                 
             except Exception as e:
