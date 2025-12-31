@@ -225,13 +225,18 @@ class TaskExecutor:
 
         def _run_streaming():
              try:
-                 # stream=True returns (exit_code, generator) in newer docker-py
-                 # We need to extract the generator
-                 _, stream = container.exec_run(final_cmd, workdir="/workspace", environment=env, stream=True)
+                 # exec_run returns vary by docker-py version
+                 exec_result = container.exec_run(final_cmd, workdir="/workspace", environment=env, stream=True)
+                 
+                 # Handle both tuple (exit_code, generator) and just generator
+                 if isinstance(exec_result, tuple):
+                     stream = exec_result[1]
+                 else:
+                     stream = exec_result
                  
                  with open(log_file, "wb") as f:
                      for chunk in stream:
-                         if chunk: # Only write if chunk is not empty
+                         if chunk:
                              f.write(chunk)
              except Exception as e:
                  logger.error("Stream error", error=str(e))
