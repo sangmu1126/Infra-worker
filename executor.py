@@ -53,14 +53,13 @@ class TaskExecutor:
         container = None
         host_work_dir = None
         
-        # 0. Global Concurrency Limit
         acquired = self.metrics.global_limit.acquire(blocking=True, timeout=30)
         if not acquired:
             logger.error("Global container limit reached", request_id=task.request_id)
             return self._create_busy_response(task, start_time)
 
         try:
-            # 1. Acquire Container
+            # Acquire Container
             try:
                 container = self.containers.acquire_container(task.runtime, task.function_id)
             except Exception as e:
@@ -69,14 +68,14 @@ class TaskExecutor:
 
             is_warm = getattr(container, "is_warm", False)
             
-            # 2. Resource Limits (Optimized: skip if warm container has same memory)
+            # Resource Limits
             current_mem = getattr(container, "_mem_limit_mb", None)
             if not is_warm or current_mem != task.memory_mb:
                 self.containers.update_resources(container, task.memory_mb)
                 container._mem_limit_mb = task.memory_mb
 
             
-            # 3. Workspace Preparation
+            # Workspace Preparation
             if is_warm:
                 logger.info("⚡ Warm Start: Skipping Host Workspace Prep", id=container.id[:12])
                 host_work_dir = Path(config.DOCKER_WORK_DIR_ROOT) / task.request_id
@@ -87,7 +86,7 @@ class TaskExecutor:
                 )
                 self.storage.inject_dependencies(host_work_dir)
 
-            # 4. Command & Payload Setup
+            # Command & Payload Setup
             host_output_dir = host_work_dir / "output"
             host_output_dir.mkdir(parents=True, exist_ok=True)
             
@@ -98,20 +97,20 @@ class TaskExecutor:
                 with open(host_work_dir / "payload.json", "w") as f:
                     f.write(payload_str)
             
-            # 5. Inject into Container
+            # Inject into Container
             # Logic: If Cold Start OR Payload file needed, we copy.
             if not is_warm or use_payload_file:
                 self.containers.copy_to_container(container, host_work_dir, "/workspace")
             
             cmd, env_vars = self._build_command(task, use_payload_file)
             
-            # 6. Execute with Timeout
+            # Execute with Timeout
             start_io = self.containers.get_io_bytes(container.id)
             self.containers.reset_cgroup_peak(container.id)
             
             exit_code, output_bytes = self._execute_in_container(container, cmd, env_vars, task.timeout_ms, host_output_dir)
             
-            # 7. Metrics & Cleanup
+            # Metrics & Cleanup
             end_io = self.containers.get_io_bytes(container.id)
             peak_memory = self.containers.get_cgroup_memory_peak(container.id)
             
@@ -208,7 +207,7 @@ class TaskExecutor:
         elif task.runtime == "nodejs":
             cmd_str = f"{setup_cmd} && node /workspace/index.js"
         elif task.runtime == "cpp":
-            # Optimized: Check if binary exists (Warm Start), else compile (Cold Start)
+            # C++ Execution
             cmd_str = f"{setup_cmd} && if [ -f /workspace/main ]; then chmod +x /workspace/main && /workspace/main; else g++ /workspace/main.cpp -o /workspace/main && /workspace/main; fi"
         elif task.runtime == "go":
             cmd_str = f"{setup_cmd} && cd /workspace && if [ -f main ]; then chmod +x main && ./main; else go build -o main main.go && ./main; fi"
@@ -226,11 +225,14 @@ class TaskExecutor:
 
         def _run_streaming():
              try:
-                 # stream=True returns output generator
-                 stream = container.exec_run(final_cmd, workdir="/workspace", environment=env, stream=True)
+                 # stream=True returns (exit_code, generator) in newer docker-py
+                 # We need to extract the generator
+                 _, stream = container.exec_run(final_cmd, workdir="/workspace", environment=env, stream=True)
+                 
                  with open(log_file, "wb") as f:
                      for chunk in stream:
-                         f.write(chunk)
+                         if chunk: # Only write if chunk is not empty
+                             f.write(chunk)
              except Exception as e:
                  logger.error("Stream error", error=str(e))
                  with open(log_file, "ab") as f:
