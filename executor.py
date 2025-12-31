@@ -109,7 +109,7 @@ class TaskExecutor:
             start_io = self.containers.get_io_bytes(container.id)
             self.containers.reset_cgroup_peak(container.id)
             
-            exit_code, output_bytes = self._execute_in_container(container, cmd, env_vars, task.timeout_ms)
+            exit_code, output_bytes = self._execute_in_container(container, cmd, env_vars, task.timeout_ms, host_output_dir)
             
             # 7. Metrics & Cleanup
             end_io = self.containers.get_io_bytes(container.id)
@@ -215,31 +215,54 @@ class TaskExecutor:
             
         return ["sh", "-c", cmd_str], env_vars
 
-    def _execute_in_container(self, container, cmd, env, timeout_ms):
+    def _execute_in_container(self, container, cmd, env, timeout_ms, output_dir: Path):
         result = {"exit_code": -1, "output": b""}
+        log_file = output_dir / "stdout.log"
         
-        def _run():
-            try:
-                # Truncate output to prevent OOM
-                ec, out = container.exec_run(cmd, workdir="/workspace", environment=env)
-                
-                if len(out) > config.MAX_OUTPUT_SIZE:
-                    out = out[:config.MAX_OUTPUT_SIZE] + b"\n...[TRUNCATED: Output exceeded limit]..."
-                    
-                result["exit_code"] = ec
-                result["output"] = out
-            except Exception as e:
-                result["output"] = str(e).encode()
+        # Inject exit code capture into the command
+        final_cmd = cmd
+        if cmd[0] == "sh" and cmd[1] == "-c":
+             final_cmd = ["sh", "-c", f"{{ {cmd[2]} ; }} ; echo $? > /workspace/exit_code.txt"]
 
-        t = threading.Thread(target=_run)
+        def _run_streaming():
+             try:
+                 # stream=True returns output generator
+                 stream = container.exec_run(final_cmd, workdir="/workspace", environment=env, stream=True)
+                 with open(log_file, "wb") as f:
+                     for chunk in stream:
+                         f.write(chunk)
+             except Exception as e:
+                 logger.error("Stream error", error=str(e))
+                 with open(log_file, "ab") as f:
+                     f.write(f"\n[System Error] {str(e)}".encode())
+
+        t = threading.Thread(target=_run_streaming)
         t.start()
         t.join(timeout=timeout_ms / 1000.0)
         
         if t.is_alive():
             try: container.stop(timeout=1)
             except: pass
+            with open(log_file, "ab") as f:
+                f.write(b"\n...[TIMEOUT]...")
             raise TimeoutError(f"Execution timed out after {timeout_ms}ms")
             
+        # Read Exit Code
+        try:
+            ec_out = container.exec_run("cat /workspace/exit_code.txt", workdir="/workspace")
+            result["exit_code"] = int(ec_out.output.decode().strip())
+        except:
+            result["exit_code"] = -1 # content not found or error
+            
+        # Read Head of Log for DynamoDB (Preview)
+        try:
+            with open(log_file, "rb") as f:
+                result["output"] = f.read(config.MAX_OUTPUT_SIZE)
+                if os.path.getsize(log_file) > config.MAX_OUTPUT_SIZE:
+                     result["output"] += b"\n...[TRUNCATED: Full logs in S3]..."
+        except:
+            result["output"] = b""
+
         return result["exit_code"], result["output"]
 
     def _read_llm_usage(self, output_dir: Path) -> int:
