@@ -223,19 +223,27 @@ class TaskExecutor:
         if cmd[0] == "sh" and cmd[1] == "-c":
              final_cmd = ["sh", "-c", f"{{ {cmd[2]} ; }} ; echo $? > /workspace/exit_code.txt"]
 
-        # Simple non-streaming execution (reliable for outputs < MAX_OUTPUT_SIZE)
-        def _run_exec():
+        # Streaming execution (faster, may have occasional issues)
+        def _run_streaming():
             try:
-                exec_result = container.exec_run(final_cmd, workdir="/workspace", environment=env, stream=False)
+                exec_result = container.exec_run(final_cmd, workdir="/workspace", environment=env, stream=True)
+                
+                # Handle both tuple (exit_code, generator) and just generator
+                if isinstance(exec_result, tuple):
+                    stream = exec_result[1]
+                else:
+                    stream = exec_result
+                
                 with open(log_file, "wb") as f:
-                    if exec_result.output:
-                        f.write(exec_result.output)
+                    for chunk in stream:
+                        if chunk:
+                            f.write(chunk)
             except Exception as e:
-                logger.error("Exec error", error=str(e))
+                logger.error("Stream error", error=str(e))
                 with open(log_file, "wb") as f:
-                    f.write(f"[Execution Error] {str(e)}".encode())
+                    f.write(f"[Stream Error] {str(e)}".encode())
 
-        t = threading.Thread(target=_run_exec)
+        t = threading.Thread(target=_run_streaming)
         t.start()
         t.join(timeout=timeout_ms / 1000.0)
         
