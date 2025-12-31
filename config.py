@@ -39,3 +39,7 @@ WARM_POOL_SIZES = {
     "nodejs": int(os.getenv("WARM_POOL_NODEJS_SIZE", 1)),
     "go": int(os.getenv("WARM_POOL_GO_SIZE", 1))
 }
+
+# --- Execution Limits ---
+# Max size of stdout/stderr to capture (bytes)
+MAX_OUTPUT_SIZE = int(os.getenv("MAX_OUTPUT_SIZE", 1024 * 1024)) # 1MB
