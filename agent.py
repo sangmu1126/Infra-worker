@@ -5,6 +5,8 @@ import threading
 import signal
 import sys
 import socket
+import urllib.request
+import urllib.error
 import boto3
 import redis
 import structlog
@@ -75,6 +77,9 @@ class InfraAgent:
         
         # Start Health Check Server (port 8001)
         threading.Thread(target=self._start_health_server, daemon=True).start()
+        
+        # Start Heartbeat Push to Controller (every 10 seconds)
+        threading.Thread(target=self._heartbeat_push, daemon=True).start()
 
         while self.running:
             try:
@@ -195,6 +200,56 @@ class InfraAgent:
                 logger.warning("Failed to publish system status", error=str(e))
             
             time.sleep(2)
+
+    def _heartbeat_push(self):
+        """
+        [Background Task] Push Heartbeat to Controller
+        - Frequency: Every 10 seconds
+        - Data: Worker status, pools, active jobs
+        - Purpose: Controller knows Worker is alive (NAT-free health check)
+        """
+        controller_url = self.config.get("CONTROLLER_URL", "")
+        if not controller_url:
+            logger.warning("CONTROLLER_URL not set, heartbeat push disabled")
+            return
+            
+        heartbeat_endpoint = f"{controller_url}/api/worker/heartbeat"
+        worker_id = socket.gethostname()
+        
+        while self.running:
+            try:
+                heartbeat_data = {
+                    "workerId": worker_id,
+                    "timestamp": time.time(),
+                    "status": "healthy" if self.running else "stopping",
+                    "pools": {
+                        "python": len(self.executor.containers.pools["python"]),
+                        "nodejs": len(self.executor.containers.pools["nodejs"]),
+                        "cpp": len(self.executor.containers.pools["cpp"]),
+                        "go": len(self.executor.containers.pools["go"])
+                    },
+                    "activeJobs": self.active_jobs._value.get(),
+                    "uptimeSeconds": int(time.time() - self._start_time)
+                }
+                
+                # Send HTTP POST to Controller
+                req = urllib.request.Request(
+                    heartbeat_endpoint,
+                    data=json.dumps(heartbeat_data).encode('utf-8'),
+                    headers={'Content-Type': 'application/json'},
+                    method='POST'
+                )
+                
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    if response.status == 200:
+                        logger.debug("Heartbeat sent successfully")
+                
+            except urllib.error.URLError as e:
+                logger.warning("Heartbeat push failed", error=str(e))
+            except Exception as e:
+                logger.warning("Heartbeat push error", error=str(e))
+            
+            time.sleep(10)  # Every 10 seconds
 
     def _start_health_server(self):
         """Start a simple HTTP health check server on port 8001"""
