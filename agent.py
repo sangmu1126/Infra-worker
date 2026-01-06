@@ -190,7 +190,8 @@ class InfraAgent:
                         "cpp": len(self.executor.containers.pools["cpp"]),
                         "go": len(self.executor.containers.pools["go"])
                     },
-                    "active_jobs": self.active_jobs._value.get()
+                    "active_jobs": self.active_jobs._value.get(),
+                    "uptime_seconds": int(time.time() - self._start_time)
                 }
                 
                 # Publish to Redis
