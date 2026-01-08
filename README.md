@@ -81,7 +81,7 @@ The **Auto-Tuner** is a built-in feedback loop that optimizes your infrastructur
 | Feature | Description |
 | :--- | :--- |
 | **⚡ Zero Cold Start** | Pre-warmed containers (Warm Pool) ensure instant execution for Python, Node.js, Go. |
-| **�️ Sec-Hardened** | Docker isolation, Zip Slip protection, and rigid resource quotas prevent breakout attacks. |
+| **🛡️ Sec-Hardened** | Docker isolation, Zip Slip protection, and rigid resource quotas prevent breakout attacks. |
 | **📡 Streaming I/O** | Direct S3 streaming for large payloads (GBs) with minimal memory footprint (~90ms overhead). |
 | **📈 Live Metrics** | Exposes `worker_jobs_processed`, `duration_seconds`, and resource usage to Prometheus. |
 
@@ -111,7 +111,7 @@ sudo python agent.py
 
 ---
 
-## � Observability
+## 📊 Observability
 
 ### Prometheus Metrics (`:8000/metrics`)
 | Metric | Type | Description |
