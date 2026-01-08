@@ -20,6 +20,7 @@ MAX_POOL_SIZE_PER_FUNC = 5
 # OS-specific Cgroup paths (Amazon Linux 2023 / Cgroup v2)
 CGROUP_PATH_IO_STAT = "/sys/fs/cgroup/system.slice/docker-{container_id}.scope/io.stat"
 CGROUP_PATH_MEMORY_PEAK = "/sys/fs/cgroup/system.slice/docker-{container_id}.scope/memory.peak"
+CGROUP_PATH_CPU_STAT = "/sys/fs/cgroup/system.slice/docker-{container_id}.scope/cpu.stat"
 
 # Docker Work Directory (Host)
 DOCKER_WORK_DIR_ROOT = os.getenv("DOCKER_WORK_DIR_ROOT", "/tmp/faas/workspace")

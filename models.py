@@ -30,6 +30,12 @@ class ExecutionResult:
     allocated_memory_mb: Optional[int] = None
     optimization_tip: Optional[str] = None
     estimated_savings: Optional[str] = None
+    recommended_memory_mb: Optional[int] = None
+    cpu_usage: float = 0.0
+    network_rx: int = 0
+    network_tx: int = 0
+    disk_read: int = 0
+    disk_write: int = 0
     output_files: List[str] = field(default_factory=list)
     llm_token_count: Optional[int] = 0
 
@@ -44,8 +50,15 @@ class ExecutionResult:
             "stderr": self.stderr,
             "durationMs": self.duration_ms,
             "peakMemoryBytes": self.peak_memory_bytes,
+            "allocatedMemoryMb": self.allocated_memory_mb,
             "optimizationTip": self.optimization_tip,
             "estimatedSavings": self.estimated_savings,
+            "recommendedMemoryMb": self.recommended_memory_mb,
+            "cpuUsage": self.cpu_usage,
+            "networkRx": self.network_rx,
+            "networkTx": self.network_tx,
+            "diskRead": self.disk_read,
+            "diskWrite": self.disk_write,
             "outputFiles": self.output_files,
             "llm_token_count": self.llm_token_count
         }
