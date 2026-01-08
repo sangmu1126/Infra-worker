@@ -44,3 +44,7 @@ WARM_POOL_SIZES = {
 # --- Execution Limits ---
 # Max size of stdout/stderr to capture (bytes)
 MAX_OUTPUT_SIZE = int(os.getenv("MAX_OUTPUT_SIZE", 1024 * 1024)) # 1MB
+
+# --- AI Node Configuration ---
+AI_ENDPOINT = os.getenv("AI_ENDPOINT", "http://10.0.20.100:11434")
+AI_SDK_PATH = os.path.join(os.path.dirname(__file__), "ai_client.py")
