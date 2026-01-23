@@ -232,7 +232,7 @@ class TaskExecutor:
         else:
             env_vars["PAYLOAD"] = json.dumps(task.payload)
 
-        setup_cmd = "rm -rf /output /tmp/* && mkdir -p /output"
+        setup_cmd = "mkdir -p /output && rm -rf /output/* 2>/dev/null || true"
         
         # Simple command builder (can be moved to a Factory if complex)
         cmd_str = ""
@@ -260,7 +260,7 @@ class TaskExecutor:
         # Streaming execution (faster, may have occasional issues)
         def _run_streaming():
             try:
-                exec_result = container.exec_run(final_cmd, workdir="/workspace", environment=env, stream=True)
+                exec_result = container.exec_run(final_cmd, workdir="/workspace", environment=env, stream=True, user="appuser")
                 
                 # Handle both tuple (exit_code, generator) and just generator
                 if isinstance(exec_result, tuple):
@@ -290,7 +290,7 @@ class TaskExecutor:
             
         # Read Exit Code
         try:
-            ec_out = container.exec_run("cat /workspace/exit_code.txt", workdir="/workspace")
+            ec_out = container.exec_run("cat /workspace/exit_code.txt", workdir="/workspace", user="appuser")
             result["exit_code"] = int(ec_out.output.decode().strip())
         except:
             result["exit_code"] = -1 # content not found or error
