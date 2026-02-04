@@ -102,9 +102,9 @@ class TaskExecutor:
             if not is_warm or use_payload_file:
                 self.containers.copy_to_container(container, host_work_dir, "/workspace")
             
-            # Inject AI SDK (faas_sdk.py) for Python runtime
+            # Inject System Files (Runner, SDK, AI Client) for Python
             if task.runtime == "python":
-                self._inject_ai_sdk(container)
+                self._inject_system_files(container)
             
             cmd, env_vars = self._build_command(task, use_payload_file)
             
@@ -237,7 +237,8 @@ class TaskExecutor:
         # Simple command builder (can be moved to a Factory if complex)
         cmd_str = ""
         if task.runtime == "python":
-            cmd_str = f"{setup_cmd} && python /workspace/main.py"
+            # Use runner.py as the entry point to handle SDK logic purely
+            cmd_str = f"{setup_cmd} && python /workspace/runner.py"
         elif task.runtime == "nodejs":
             cmd_str = f"{setup_cmd} && node /workspace/index.js"
         elif task.runtime == "cpp":
@@ -333,19 +334,32 @@ class TaskExecutor:
         
         threading.Thread(target=_bg, daemon=True).start()
 
-    def _inject_ai_sdk(self, container):
-        """Inject ai_client.py into container as faas_sdk.py for user code to import."""
+    def _inject_system_files(self, container):
+        """Inject runner.py, sdk.py, and ai_client.py into container."""
         try:
-            sdk_path = Path(config.AI_SDK_PATH)
-            if sdk_path.exists():
-                # Create a temporary directory with the SDK file renamed
-                import tempfile
-                import shutil
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    dest = Path(tmpdir) / "faas_sdk.py"
-                    shutil.copy(sdk_path, dest)
-                    self.containers.copy_to_container(container, Path(tmpdir), "/workspace")
-                logger.debug("AI SDK injected", container_id=container.id[:12])
+            import tempfile
+            import shutil
+            
+            # Paths to inject
+            files_to_inject = {
+                "runner.py": Path(__file__).parent / "runner.py",
+                "sdk.py": Path(__file__).parent / "sdk.py",
+                "ai_client.py": Path(config.AI_SDK_PATH)
+            }
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_path = Path(tmpdir)
+                injected_count = 0
+                
+                for filename, src_path in files_to_inject.items():
+                    if src_path.exists():
+                        shutil.copy(src_path, tmp_path / filename)
+                        injected_count += 1
+                
+                if injected_count > 0:
+                    self.containers.copy_to_container(container, tmp_path, "/workspace")
+                    logger.debug(f"System files injected: {injected_count}", container_id=container.id[:12])
+                    
         except Exception as e:
-            logger.warning("Failed to inject AI SDK", error=str(e))
+            logger.warning("Failed to inject system files", error=str(e))
 
